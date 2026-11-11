@@ -1,0 +1,35 @@
+# Gantraah on the internal server: application + PostgreSQL.
+# Usage (in this folder):  docker compose --env-file compose.env up -d
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gantraah
+      POSTGRES_USER: gantraah
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in compose.env}
+    volumes:
+      - gantraah-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gantraah -d gantraah"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    image: gantraah:${GANTRAAH_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://gantraah:${DB_PASSWORD}@db:5432/gantraah
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SEED_DEMO: ${SEED_DEMO:-false}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    ports:
+      - "${HTTP_PORT:-80}:8080"
+
+volumes:
+  gantraah-db:

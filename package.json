@@ -1,0 +1,12 @@
+{
+  "name": "gantraah",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "build": "npm --prefix client run build",
+    "start": "node server/src/index.js",
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "node --watch server/src/index.js",
+    "package": "powershell -ExecutionPolicy Bypass -File deploy/build-offline.ps1"
+  }
+}
