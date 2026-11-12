@@ -16,13 +16,14 @@ interface Step {
 const act = (name: string) => window.dispatchEvent(new CustomEvent('gantraah-tour', { detail: name }));
 
 export const MAIN_STEPS: Step[] = [
-  { title: 'ברוכים הבאים ל-Gantraah', text: 'סיור קצר של חצי דקה: מה יש כאן ואיך עובדים. אפשר לדלג בכל רגע.' },
-  { target: '[data-tour="nav"]', title: 'המסכים', text: 'תכנית עבודה: לעבודה היומיומית. מפת השפעות: מה משפיע על משימה ומה היא משפיעה. תצוגת מנהלים: למסך הגדול בחדר הישיבות.' },
-  { target: '[data-tour="add"]', title: 'הוספת משימות', text: 'מכאן מוסיפים משימה, תת-משימה או אבן דרך. משימה חדשה שייכת למסגרת שלך.' },
+  { title: 'ברוכים הבאים ל-Ganttraah', text: 'סיור קצר של חצי דקה: מה יש כאן ואיך עובדים. אפשר לדלג בכל רגע.' },
+  { target: '[data-tour="nav"]', title: 'המסכים', text: 'תכנית עבודה: לעבודה היומיומית. מפת תלויות: מה משפיע על משימה ועל מה היא משפיעה. תצוגת מנהלים: למסך הגדול בחדר הישיבות.' },
+  { target: '[data-tour="add"]', title: 'יצירה', text: 'מכאן יוצרים משימה, תת-משימה או אבן דרך. משימה חדשה שייכת למסגרת שלך.' },
   { target: '.g-table', title: 'רשימת המשימות', text: 'כל שורה היא משימה. לחיצה פותחת את הפרטים בצד, ולחיצה כפולה על השם משנה אותו.' },
   { target: '.g-chart', title: 'ציר הזמן', text: 'גוררים פס כדי להזיז משימה, ומושכים את הקצה שלו כדי לשנות את המשך. כדי לקשר בין משימות, גוררים מהעיגול שבקצה הפס אל משימה אחרת.' },
   { target: '[data-tour="undo"]', title: 'טעיתם?', text: 'החיצים מבטלים ומחזירים את הפעולה האחרונה. אפשר גם עם Ctrl+Z.' },
-  { target: '[data-tour="filters"]', title: 'סינון', text: 'מכאן מציגים רק פרויקט מסוים, או רק את המשימות של מסגרות מסוימות.' },
+  { target: '[data-tour="filters"]', title: 'פרויקטים ומועדפים', text: 'כאן מופיעים הפרויקטים שלך ואחוז ההתקדמות שלהם. לחיצה מציגה רק אותם. משימות שסימנת בכוכב מוצגות בכפתור "מועדפים".' },
+  { target: '[data-tour="owners"]', title: 'אחראים ומקרא', text: 'בכניסה מוצגות המשימות של המסגרת שלך ושל המסגרות שמתחתיה. מכאן משנים את זה, ו"מקרא" מסביר כל סימון בגאנט.' },
   { target: '[data-tour="help"]', title: 'זהו!', text: 'אפשר לחזור לסיור בכל זמן מהכפתור הזה.' },
 ];
 
@@ -32,6 +33,24 @@ export const PRESENT_STEPS: Step[] = [
   { target: '.mt-row.popped .mt-hit|.mt-stack', need: '[data-tour="m-timeline"]', action: 'pop', title: 'מה משפיע ועל מה', text: 'עומדים עם העכבר שנייה על פס, ולידו קופצות המשימות שמשפיעות עליו (מימין, בכתום) והמשימות שמושפעות ממנו (משמאל, בסגול). לחיצה על אחת מהן פותחת את הפרטים שלה.' },
   { target: '.mt-row.tour-hl', need: '[data-tour="m-timeline"]', action: 'open', title: 'מה יש בתוך שלב', text: 'לחיצה על שלב פותחת מתחתיו את המשימות שבתוכו. לחיצה נוספת סוגרת.' },
   { target: '[data-tour="m-tools"]', title: 'הגדרות ומסך מלא', text: 'בגלגל השיניים בוחרים מה להציג. הכפתור שלידו פותח מסך מלא לחדר הישיבות.' },
+];
+
+export const SETTINGS_STEPS: Step[] = [
+  { target: '[data-tour="s-workdays"]', title: 'ימי עבודה', text: 'משך המשימות נספר בימי עבודה בלבד, א\'-ה\'. כל חג או יום מיוחד מזיז את התאריכים לבד.' },
+  { target: '[data-tour="s-holidays"]', title: 'חגים ומועדים', text: 'כאן נקבע אילו חגים הם ימי חופש. רק הנהלת הענף משנה את זה.' },
+  { target: '[data-tour="s-special"]', title: 'ימים מיוחדים', text: 'יום חופש או טווח של כמה ימים. יום של מסגרת משפיע רק על המשימות שלה ושל מי שמתחתיה, וכולם רואים אותו ברשימה.' },
+  { target: '[data-tour="s-list"]', title: 'החגים של השנה', text: 'כל החגים והמועדים של השנה הנוכחית והבאה. הקו האדום מראה איפה אנחנו היום.' },
+  { target: '[data-tour="s-org"]', title: 'מבנה ארגוני והרשאות', text: 'בלשונית הזו הנהלת הענף עורכת את המסגרות, מעבירה צוותים בגרירה, וקובעת לכל מסגרת אם היא צופה או עורכת. ללשונית יש סיור משלה: פותחים אותה ולוחצים שוב על "סיור".' },
+];
+
+export const ORG_STEPS: Step[] = [
+  { target: '.org-tree.edit', title: 'המבנה הארגוני', text: 'כל המסגרות של הענף, כמו בדף הכניסה. כל שינוי כאן מופיע מיד בתכנית העבודה, בסינונים ובבחירת האחראי.' },
+  { target: '.ou-card.section .ou-top', title: 'שינוי שם ומחיקה', text: 'העיפרון משנה את שם המסגרת, והפח מוחק אותה. אי אפשר למחוק מסגרת שיש באחריותה משימות פתוחות: קודם מעבירים אותן למסגרת אחרת. משימות שהושלמו עוברות למסגרת שמעליה.' },
+  { target: '.ou-card.section .ou-meta', title: 'משימות והרשאה', text: 'כמה משימות פתוחות יש באחריות המסגרת. לחיצה על המספר מציגה אותן, ולחיצה על משימה פותחת אותה בתכנית העבודה. בתיבה בוחרים הרשאה: "צופה" עורכת רק את המשימות שלה ושל מי שמתחתיה, ו"עורך" עורכת גם משימות של אחרים.' },
+  { target: '.ou-card.team', title: 'העברה בגרירה', text: 'גוררים צוות מהידית שליד השם ומשחררים על מדור אחר, והצוות עובר אליו עם כל המשימות שלו.' },
+  { target: '.ou-card.section', action: 'org-add', title: 'הוספת מסגרת', text: 'כשהעכבר על מסגרת, מתחתיה מופיע הכפתור "+ צוות" (או "+ מדור" בהנהלת הענף), שמוסיף מסגרת חדשה תחתיה.' },
+  { target: '[data-tour="s-pw"]', title: 'סיסמת הנהלת הענף', text: 'רק הכניסה כהנהלת הענף מוגנת בסיסמה. כאן מחליפים אותה: מזינים פעמיים את הסיסמה החדשה.' },
+  { target: '.perm-note', title: 'מה כל הרשאה אומרת', text: 'ההסבר המלא נמצא כאן תמיד. ההגדרות והפרויקטים נשארים בידי הנהלת הענף בכל מקרה.' },
 ];
 
 export function Tour({ onClose, steps: all = MAIN_STEPS }: { onClose: () => void; steps?: Step[] }) {
@@ -68,14 +87,17 @@ export function Tour({ onClose, steps: all = MAIN_STEPS }: { onClose: () => void
       }
       setRect(el ? el.getBoundingClientRect() : null);
     };
+    document.body.classList.toggle('tour-org-add', step.action === 'org-add');
     if (step.action) act(step.action);
-    measure();
-    // give the page a moment to show what the step demonstrates, then measure again
-    const t1 = window.setTimeout(measure, 120), t2 = window.setTimeout(measure, 450);
+    // a step that demonstrates something (cards popping out, a phase opening) is measured once,
+    // after the demonstration has settled, so the spotlight glides there in one move
+    const demo = step.action === 'pop' || step.action === 'open';
+    if (!demo) measure();
+    const t1 = window.setTimeout(measure, demo ? 720 : 120), t2 = window.setTimeout(measure, demo ? 900 : 450);
     window.addEventListener('resize', measure);
     return () => { clearTimeout(t1); clearTimeout(t2); window.removeEventListener('resize', measure); };
   }, [step]);
-  useEffect(() => () => { act('reset'); }, []); // leave the page as it was
+  useEffect(() => () => { act('reset'); document.body.classList.remove('tour-org-add'); }, []); // leave the page as it was
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -117,7 +139,7 @@ export function Tour({ onClose, steps: all = MAIN_STEPS }: { onClose: () => void
           <span style={{ flex: 1 }} />
           {!last && <button className="link" onClick={onClose}>דלג</button>}
           {i > 0 && <button className="btn small" onClick={() => setI(i - 1)}>הקודם</button>}
-          <button className="btn primary small" onClick={next} autoFocus>{last ? 'סיום' : i === 0 ? 'יאללה' : 'הבא'}</button>
+          <button className="btn primary small" onClick={next} autoFocus>{last ? 'סיום' : 'הבא'}</button>
         </div>
       </div>
     </div>

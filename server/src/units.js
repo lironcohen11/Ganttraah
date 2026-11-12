@@ -136,7 +136,37 @@ export function effectiveOwner(sched, taskId) {
 
 export function canEditTask(user, units, sched, taskId) {
   if (!user) return false;
-  if (user.role === 'admin') return true;
+  if (user.role === 'admin' || (user.role === 'editor' && user.edit_all)) return true;
   if (user.role !== 'editor' || !user.unit_id) return false;
   return isWithin(units, effectiveOwner(sched, taskId), user.unit_id);
+}
+
+/** One-time move of the old single-day exceptions into special_days (1.5.0). */
+export async function migrateSpecialDays() {
+  if ((await db.query("SELECT 1 FROM settings WHERE key='special_days_v1'")).length) return 0;
+  let n = 0;
+  await db.tx(async (tx) => {
+    const old = await tx.query('SELECT * FROM calendar_exceptions ORDER BY day');
+    for (const e of old) {
+      await tx.query('INSERT INTO special_days (unit_id, start_day, end_day, kind, label) VALUES (NULL,$1,$1,$2,$3)', [e.day, e.kind, e.label || '']);
+      n++;
+    }
+    await tx.query(`INSERT INTO settings (key, value) VALUES ('special_days_v1', 'true') ON CONFLICT (key) DO NOTHING`);
+  });
+  return n;
+}
+
+/** kind of a unit by its depth: root = branch, depth 1 = section, deeper = team */
+export const kindAtDepth = (depth) => (depth === 0 ? 'branch' : depth === 1 ? 'section' : 'team');
+export function unitDepth(units, id) {
+  const parent = new Map(units.map((u) => [u.id, u.parent_id]));
+  let d = 0;
+  for (let x = parent.get(id) ?? null; x != null && d < 50; x = parent.get(x) ?? null) d++;
+  return d;
+}
+export function unitSubtree(units, id) {
+  const out = new Set([id]);
+  let grew = true;
+  while (grew) { grew = false; for (const u of units) if (u.parent_id != null && out.has(u.parent_id) && !out.has(u.id)) { out.add(u.id); grew = true; } }
+  return out;
 }

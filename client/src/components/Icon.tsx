@@ -32,11 +32,28 @@ const PATHS: Record<string, string> = {
   filter: 'M3 5h18l-7 8v6l-4-2v-4z',
   undo:'M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 010 11H11',
   redo: 'M15 14l5-5-5-5M20 9H9.5a5.5 5.5 0 000 11H13',
+  // dependency map: one task in the middle, linked to tasks on both sides
+  deps: 'M12 12m-2.5 0a2.5 2.5 0 105 0 2.5 2.5 0 10-5 0M4 6.5m-2 0a2 2 0 104 0 2 2 0 10-4 0M4 17.5m-2 0a2 2 0 104 0 2 2 0 10-4 0M20 12m-2 0a2 2 0 104 0 2 2 0 10-4 0M5.8 7.6l3.9 3.1M5.8 16.4l3.9-3.1M14.5 12H18',
+  star: 'M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z',
+  hover: 'M9 4v9l2.2-2 1.8 4.2 2-.9-1.8-4.1H16zM18 4.5a3 3 0 11-.01 0M18 3.5v1.3l.9.9',
+  click: 'M9 9l5 12 1.8-5.2L21 14zM5 3.5l1 1.8M3.5 7.5l1.8.4M9.5 3l-.3 2',
+  legend: 'M4 6h3M4 12h3M4 18h3M10 6h10M10 12h10M10 18h10',
+  refresh: 'M20 11a8 8 0 10-2.3 5.7M20 4v7h-7',
+  grip: 'M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01',
+  download: 'M12 4v11M7 10l5 5 5-5M5 20h14',
+  upload: 'M12 16V5M7 10l5-5 5 5M5 20h14',
+  sun: 'M12 16a4 4 0 100-8 4 4 0 000 8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4',
+  moon: 'M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z',
+  auto: 'M12 3a9 9 0 100 18 9 9 0 000-18zM12 3v18M12 7.5h4M12 12h5M12 16.5h4',
+  table: 'M4 5h16v14H4zM4 10h16M4 15h16M10 5v14',
+  file: 'M14 3H6v18h12V7zM14 3v4h4M9 13h6M9 17h6',
+  lock: 'M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 017 0v3',
+  info: 'M12 21a9 9 0 100-18 9 9 0 000 18zM12 11v5M12 8h.01',
 };
 
-export function Icon({ name, size = 16, className, strokeWidth = 2 }: { name: keyof typeof PATHS | string; size?: number; className?: string; strokeWidth?: number }) {
+export function Icon({ name, size = 16, className, strokeWidth = 2, fill }: { name: keyof typeof PATHS | string; size?: number; className?: string; strokeWidth?: number; fill?: string }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth}
+    <svg width={size} height={size} viewBox="0 0 24 24" fill={fill || 'none'} stroke="currentColor" strokeWidth={strokeWidth}
       strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
       <path d={PATHS[name] || ''} />
     </svg>

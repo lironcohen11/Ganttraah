@@ -1,4 +1,4 @@
-# Daily backup of the Gantraah database (Docker installation).
+# Daily backup of the Ganttraah database (Docker installation).
 # Run from the folder that contains docker-compose.yml, e.g. as a Windows scheduled task.
 param([string]$OutDir = ".\backups", [int]$KeepDays = 30)
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

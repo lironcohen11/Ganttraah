@@ -62,6 +62,7 @@ export async function initDb() {
 export const db = {
   query: (t, p) => impl.query(t, p),
   tx: (fn) => impl.tx(fn),
+  exec: (t) => impl.exec(t),
   get kind() { return impl?.kind; },
 };
 

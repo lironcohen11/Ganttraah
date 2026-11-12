@@ -1,7 +1,7 @@
 // Loading data, running mutations inside a transaction, audit log, and change broadcast.
 import { db, isoDate } from './db.js';
 import { computeSchedule, diffSchedules } from './scheduler.js';
-import { DEFAULT_CALENDAR } from './calendar.js';
+import { DEFAULT_CALENDAR, expandRanges } from './calendar.js';
 
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -26,13 +26,18 @@ export async function loadAll(q = db) {
   }));
   const deps = await q.query('SELECT * FROM dependencies ORDER BY id');
   const calRow = (await q.query("SELECT value FROM settings WHERE key = 'calendar'"))[0];
-  const calendarExceptions = (await q.query('SELECT * FROM calendar_exceptions ORDER BY day')).map((e) => ({
-    ...e, day: isoDate(e.day),
+  const specialDays = (await q.query('SELECT * FROM special_days ORDER BY start_day, id')).map((e) => ({
+    ...e, start_day: isoDate(e.start_day), end_day: isoDate(e.end_day),
   }));
+  const units = await q.query('SELECT id, parent_id FROM units');
   return {
     projects, tasks, deps,
-    calendarSettings: { ...DEFAULT_CALENDAR, ...(calRow?.value || {}) },
-    calendarExceptions,
+    // the working week is fixed: Sunday to Thursday
+    calendarSettings: { ...DEFAULT_CALENDAR, ...(calRow?.value || {}), workDays: DEFAULT_CALENDAR.workDays },
+    // global special days feed the shared calendar; unit special days are applied per task
+    calendarExceptions: expandRanges(specialDays.filter((r) => r.unit_id == null)),
+    specialDays,
+    units,
     today: todayISO(),
   };
 }
@@ -95,7 +100,7 @@ const UNDO_DEPTH = 40;
 
 const snapshotOf = (d) => ({
   projects: d.projects, tasks: d.tasks, deps: d.deps,
-  calendarSettings: d.calendarSettings, calendarExceptions: d.calendarExceptions,
+  calendarSettings: d.calendarSettings, specialDays: d.specialDays,
 });
 
 async function getRev(tx) {
@@ -119,14 +124,19 @@ async function restoreSnapshot(tx, s) {
   await tx.query('DELETE FROM tasks');
   await tx.query('DELETE FROM projects');
   for (const p of s.projects) await insertRow(tx, 'projects', p);
-  for (const t of s.tasks) await insertRow(tx, 'tasks', { ...t, parent_id: null });
+  // a unit may have been deleted since the snapshot: its tasks go back to "no owner"
+  const unitIds = new Set((await tx.query('SELECT id FROM units')).map((u) => u.id));
+  const ownerOk = (u) => (u == null || unitIds.has(u) ? u : null);
+  for (const t of s.tasks) await insertRow(tx, 'tasks', { ...t, parent_id: null, owner_unit_id: ownerOk(t.owner_unit_id ?? null) });
   for (const t of s.tasks) if (t.parent_id != null) await tx.query('UPDATE tasks SET parent_id=$1 WHERE id=$2', [t.parent_id, t.id]);
   for (const d of s.deps) await insertRow(tx, 'dependencies', d);
   await tx.query(`INSERT INTO settings (key, value) VALUES ('calendar', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
     [JSON.stringify(s.calendarSettings)]);
-  await tx.query('DELETE FROM calendar_exceptions');
-  for (const e of s.calendarExceptions) await insertRow(tx, 'calendar_exceptions', e);
-  for (const t of ['projects', 'tasks', 'dependencies']) {
+  if (s.specialDays) { // snapshots from before 1.5.0 have no special days: leave them as they are
+    await tx.query('DELETE FROM special_days');
+    for (const e of s.specialDays) if (e.unit_id == null || unitIds.has(e.unit_id)) await insertRow(tx, 'special_days', e);
+  }
+  for (const t of ['projects', 'tasks', 'dependencies', 'special_days']) {
     await tx.query(`SELECT setval(pg_get_serial_sequence('${t}','id'), (SELECT COALESCE(MAX(id),0)+1 FROM ${t}), false)`);
   }
 }
@@ -184,3 +194,12 @@ export async function audit(user, entry) {
   );
 }
 export const broadcast = emit;
+
+// History is kept for one year. Older entries are deleted at start-up and once a day,
+// and VACUUM lets the database reuse the space, so the file stops growing.
+export const HISTORY_DAYS = Math.max(30, Number(process.env.HISTORY_DAYS) || 365);
+export async function pruneHistory() {
+  const gone = await db.query(`DELETE FROM audit_log WHERE at < now() - make_interval(days => ${HISTORY_DAYS}) RETURNING id`);
+  if (gone.length) await db.exec('VACUUM audit_log');
+  return gone.length;
+}

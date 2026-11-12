@@ -56,6 +56,8 @@ export interface Project {
   behind_count: number;
   deadline_issues: number;
   baseline_finish: string | null;
+  /** when the original plan was last saved */
+  baseline_at?: string | null;
   cost_total: number | null;
 }
 
@@ -77,7 +79,13 @@ export interface AppData {
   db: string;
   undo: { undo: UndoEntry | null; redo: UndoEntry | null };
   units: Unit[];
+  /** special days off of one unit (and the units below it) */
+  unitDays: UnitDay[];
+  /** favourite task ids of the unit you entered as */
+  favorites: number[];
 }
+
+export interface UnitDay { id: number; unit_id: number; start_day: string; end_day: string; kind: 'off' | 'work'; label: string }
 
 export interface Unit {
   id: number;
@@ -86,6 +94,8 @@ export interface Unit {
   name: string;
   head: string;
   sort_order: number;
+  /** may edit every task in the plan, not only its own */
+  edit_all: boolean;
 }
 
 export interface UndoEntry { label: string; blocked: boolean }
@@ -99,6 +109,7 @@ export interface User {
   unit_id: number | null;
   head: string;
   kind: 'branch' | 'section' | 'team' | 'viewer' | 'account';
+  edit_all?: boolean;
 }
 
 export interface AuditEntry {

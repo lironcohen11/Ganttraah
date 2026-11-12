@@ -67,12 +67,58 @@ function isIndependenceDay(day, h) {
   return false;
 }
 
-/** Holiday info for one day, or null. */
+// ---- days shown for information only (cat 'info'): working days, but good to see in the plan
+
+// Chanukah: 25 Kislev, eight days (ends on 2 or 3 Tevet)
+function isChanukah(day, h) {
+  if (h.m === 'Kislev') return h.d >= 25;
+  if (h.m !== 'Tevet' || h.d > 3) return false;
+  for (let k = 1; k <= 7; k++) { const x = hebrew(day - k); if (x.m === 'Kislev' && x.d === 25) return true; }
+  return false;
+}
+// Purim: 14 Adar (Adar II in a leap year)
+const isPurim = (h) => h.d === 14 && (h.m === 'Adar' || h.m === 'Adar II');
+// Yom HaShoah: 27 Nisan; Friday -> Thursday, Sunday -> Monday
+function isShoah(day, h) {
+  if (h.m !== 'Nisan') return false;
+  const wd = weekday(day);
+  if (h.d === 27) return wd !== 5 && wd !== 0;
+  if (h.d === 26) return wd === 4;   // 27 Nisan was a Friday
+  if (h.d === 28) return wd === 1;   // 27 Nisan was a Sunday
+  return false;
+}
+// Tisha B'Av: 9 Av, moved to Sunday when it falls on Saturday
+function isTishaBeAv(day, h) {
+  if (h.m !== 'Av') return false;
+  if (h.d === 9) return weekday(day) !== 6;
+  if (h.d === 10) return weekday(day) === 0;
+  return false;
+}
+
+// Sigd: 29 Heshvan, moved to Thursday when it falls on Saturday. Shown for information only:
+// it is an official holiday but not a day off for everyone, so it never stops the work.
+function isSigd(day, h) {
+  if (h.m !== 'Heshvan') return false;
+  if (h.d === 29) return weekday(day) !== 6;
+  if (h.d === 27) return weekday(day) === 4 && hebrew(day + 2).d === 29 && hebrew(day + 2).m === 'Heshvan';
+  return false;
+}
+
+/** Holiday info for one day, or null. cat 'info' = shown, never a day off. */
 export function holidayOf(day) {
   const h = hebrew(day);
   const f = FIXED_MAP.get(`${h.m}-${h.d}`);
   if (f) return f;
   if (isIndependenceDay(day, h)) return { cat: 'independence', label: 'יום העצמאות' };
+  if (h.m === 'Iyar' && h.d <= 5 && isIndependenceDay(day + 1, hebrew(day + 1))) return { cat: 'info', label: 'יום הזיכרון' };
+  if (isChanukah(day, h)) return { cat: 'info', label: 'חנוכה' };
+  if (h.m === 'Shevat' && h.d === 15) return { cat: 'info', label: 'ט"ו בשבט' };
+  if (isPurim(h)) return { cat: 'info', label: 'פורים' };
+  if (isShoah(day, h)) return { cat: 'info', label: 'יום השואה' };
+  if (h.m === 'Iyar' && h.d === 18) return { cat: 'info', label: 'ל"ג בעומר' };
+  if (h.m === 'Iyar' && h.d === 28) return { cat: 'info', label: 'יום ירושלים' };
+  if (isTishaBeAv(day, h)) return { cat: 'info', label: 'תשעה באב' };
+  if (isSigd(day, h)) return { cat: 'info', label: 'חג הסיגד' };
   return null;
 }
 
@@ -89,7 +135,7 @@ function cachedHoliday(day) {
 export function buildCalendar(settings, exceptions, fromDayN, toDayN) {
   const s = { ...DEFAULT_CALENDAR, ...(settings || {}) };
   const exc = new Map((exceptions || []).map((e) => [toDay(e.day), e]));
-  const offByCat = { chag: s.chagOff, chol: s.cholHamoedOff, erev: s.erevChagOff, independence: s.independenceOff };
+  const offByCat = { chag: s.chagOff, chol: s.cholHamoedOff, erev: s.erevChagOff, independence: s.independenceOff, info: false };
 
   function dayInfo(day) {
     const e = exc.get(day);
@@ -158,6 +204,15 @@ export function holidaysInRange(fromDayN, toDayN) {
   for (let d = fromDayN; d <= toDayN; d++) {
     const h = cachedHoliday(d);
     if (h) out.push({ day: fromDay(d), ...h });
+  }
+  return out;
+}
+
+/** Expand special-day ranges [{start_day, end_day, kind, label}] into single days. */
+export function expandRanges(list) {
+  const out = [];
+  for (const r of list || []) {
+    for (let d = toDay(r.start_day); d <= toDay(r.end_day); d++) out.push({ day: fromDay(d), kind: r.kind, label: r.label || '' });
   }
   return out;
 }

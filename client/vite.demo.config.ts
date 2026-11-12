@@ -1,4 +1,4 @@
-// Builds the single-file demo: dist-demo/index.html -> deploy/out/Gantraah-demo.html
+// Builds the single-file demo: dist-demo/index.html -> deploy/out/Ganttraah-demo.html
 // Everything (code, styles, fonts, sample data, scheduling engine) is inlined; no server needed.
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';

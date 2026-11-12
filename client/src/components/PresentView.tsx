@@ -37,7 +37,10 @@ function lightOf(m: Model, t: Task): Light {
 interface MRow { projectId?: number; key: string; kind: 'project' | 'phase' | 'task' | 'milestone'; name: string; start: string; finish: string; pct: number; light: Light; color: string; depth: number; taskId?: number; hasKids: boolean }
 
 export function PresentView() {
-  const { model } = useApp();
+  const { model, user } = useApp();
+  const [favOnly, setFavOnly] = useState<boolean>(() => ls.get('favOnly', false));
+  useEffect(() => ls.set('favOnly', favOnly), [favOnly]);
+  const favs = favOnly && user.unit_id != null ? model.favorites : null;
   // what to show: project ids "p:1" / phase ids "t:5"; empty = everything
   const [pick, setPick] = useState<string[]>(() => ls.get('pick', []));
   const [owners, setOwners] = useState<number[]>(() => ls.get('ownerFilter', []));
@@ -58,6 +61,25 @@ export function PresentView() {
   }, [model]);
   const [open, setOpen] = useState<Set<number>>(new Set());   // phases opened by clicking
   const [menu, setMenu] = useState(false);
+  const [menuOut, setMenuOut] = useState(false);
+  const menuTimer = useRef(0);
+  const closeMenu = () => { setMenuOut(true); window.setTimeout(() => { setMenu(false); setMenuOut(false); }, 160); };
+  const menuLeave = () => { clearTimeout(menuTimer.current); menuTimer.current = window.setTimeout(closeMenu, 1000); };
+  const menuStay = () => { clearTimeout(menuTimer.current); setMenuOut(false); };
+  useEffect(() => () => clearTimeout(menuTimer.current), []);
+  // the divider between the four numbers and the timeline
+  const [kpiH, setKpiH] = useState<number | null>(() => ls.get('kpiH', null));
+  useEffect(() => ls.set('kpiH', kpiH), [kpiH]);
+  const kpiRef = useRef<HTMLElement>(null);
+  const startKpiDrag = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const y0 = e.clientY, h0 = kpiRef.current?.getBoundingClientRect().height || 150;
+    document.body.classList.add('no-select', 'row-resizing');
+    const mv = (ev: PointerEvent) => setKpiH(Math.max(64, Math.min(240, Math.round(h0 + ev.clientY - y0))));
+    const up = () => { window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); document.body.classList.remove('no-select', 'row-resizing'); };
+    window.addEventListener('pointermove', mv);
+    window.addEventListener('pointerup', up);
+  };
   const rootRef = useRef<HTMLDivElement>(null);
   const [isFull, setFull] = useState(false);
   useEffect(() => ls.set('pick', pick), [pick]);
@@ -94,6 +116,17 @@ export function PresentView() {
         addKids(k, depth + 1);
       }
     };
+    if (favs) {
+      // favourites only: each starred task under its project, in date order
+      for (const p of model.projectList) {
+        const list = [...favs].map((id) => model.task(id)!).filter((t) => t && t.project_id === p.id && ownerOk(t.id))
+          .sort((a, b) => a.start.localeCompare(b.start));
+        if (!list.length) continue;
+        out.push({ key: 'p' + p.id, kind: 'project', name: p.name, start: p.start, finish: p.finish, pct: p.percent, light: p.percent >= 100 ? 'done' : 'ok', color: p.color, depth: 0, hasKids: true, projectId: p.id });
+        for (const t of list) { out.push(taskRow(t, 1, t.parent_id == null)); addKids(t, 2); }
+      }
+      return out;
+    }
     for (const p of model.projectList) {
       const whole = !picks.length || picks.includes('p:' + p.id);
       const roots = p.roots.map((r) => model.task(r)!)
@@ -107,7 +140,7 @@ export function PresentView() {
     }
     return out;
     // eslint-disable-next-line
-  }, [model, picks.join(','), open, ownerIds.join(',')]);
+  }, [model, picks.join(','), open, ownerIds.join(','), favs]);
 
   // ---- the four numbers (over everything shown, including what is folded inside phases)
   const kpi = useMemo(() => {
@@ -125,7 +158,7 @@ export function PresentView() {
     return { pct, finish, slip: bl && finish ? toDay(finish) - toDay(bl) : null, late, risk, next };
   }, [rows, model]);
 
-  const title = picks.length === 1
+  const title = favs ? 'המועדפים' : picks.length === 1
     ? (picks[0].startsWith('p:') ? model.project(Number(picks[0].slice(2)))!.name : model.task(Number(picks[0].slice(2)))!.name)
     : 'תכנית העבודה';
 
@@ -133,8 +166,29 @@ export function PresentView() {
     if (!r.taskId || !r.hasKids) return;
     setOpen((s) => { const n = new Set(s); if (n.has(r.taskId!)) n.delete(r.taskId!); else n.add(r.taskId!); return n; });
   };
-  const togglePick = (k: string) => setPick((s) => (s.includes(k) ? s.filter((x) => x !== k) : [...s, k]));
-  const toggleOwner = (id: number) => setOwners((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  // ticking a project ticks its phases; unticking a phase unticks its project (it is no longer whole)
+  const phasesOf = (pid: number) => model.project(pid)!.roots.map((r) => model.task(r)!).filter((t) => t.kind !== 'milestone').map((t) => 't:' + t.id);
+  const togglePick = (k: string) => setPick((s) => {
+    const on = s.includes(k);
+    if (k.startsWith('p:')) {
+      const group = [k, ...phasesOf(Number(k.slice(2)))];
+      return on ? s.filter((x) => !group.includes(x)) : [...new Set([...s, ...group])];
+    }
+    const pk = 'p:' + model.task(Number(k.slice(2)))!.project_id;
+    if (on) return s.filter((x) => x !== k && x !== pk);
+    const next = [...s, k];
+    return phasesOf(Number(pk.slice(2))).every((x) => next.includes(x)) ? [...new Set([...next, pk])] : next;
+  });
+  // the same for units: a unit ticks the units below it, unticking one unticks the units above it
+  const toggleOwner = (id: number) => setOwners((s) => {
+    const sub = model.unitSubtree(id);
+    const above: number[] = [];
+    for (let x = model.units.get(id)?.parent_id ?? null; x != null; x = model.units.get(x)?.parent_id ?? null) above.push(x);
+    if (s.includes(id)) return s.filter((x) => !sub.includes(x) && !above.includes(x));
+    const next = new Set([...s, ...sub]);
+    for (const a of above) if (model.unitSubtree(a).every((x) => x === a || next.has(x))) next.add(a);
+    return [...next];
+  });
 
   return (
     <div className={`page meet ${isFull ? 'full' : ''}`} ref={rootRef}>
@@ -144,17 +198,33 @@ export function PresentView() {
           <div>
             <h1>{title}</h1>
             <div className="meet-date">מצב נכון ל-{fmtLong(model.data.today)}</div>
+
           </div>
         </div>
-        <div className="meet-tools" data-tour="m-tools">
-          <button className={`icon-btn ${menu ? 'on' : ''}`} title="הגדרות תצוגה" onClick={() => setMenu(!menu)}><Icon name="settings" size={18} /></button>
+        <div className="meet-tools" data-tour="m-tools" onMouseLeave={() => menu && menuLeave()} onMouseEnter={menuStay}>
+          {(picks.length > 0 || ownerIds.length > 0) && !favs && (
+            <button className="btn small filter-on" onClick={() => { setPick([]); setOwners([]); }}
+              title={[picks.length > 0 && 'מוצג רק מה שסומן ב"מה להציג"', ownerIds.length > 0 && 'מוצגות רק משימות של המסגרות שסומנו'].filter(Boolean).join(' · ')}>
+              <Icon name="filter" size={14} /> נקה סינון
+            </button>
+          )}
+          {favs && <button className="btn small fav-on" onClick={() => setFavOnly(false)} title="חזרה לכל התוכנית"><Icon name="star" size={14} fill="currentColor" /> מועדפים בלבד <Icon name="x" size={12} /></button>}
+          <button className={`icon-btn ${menu ? 'on' : ''}`} title="הגדרות תצוגה" onClick={() => (menu ? closeMenu() : setMenu(true))}><Icon name="settings" size={19} /></button>
           <button className="icon-btn" title={isFull ? 'יציאה ממסך מלא' : 'מסך מלא'}
             onClick={() => (document.fullscreenElement ? document.exitFullscreen() : rootRef.current?.requestFullscreen())}><Icon name="expand" size={18} /></button>
           {menu && (
-            <div className="meet-menu">
+            <div className={`meet-menu ${menuOut ? 'out' : ''}`}>
               <div className="mm-head">
                 <b>הגדרות תצוגה</b>
-                <button className="icon-btn" onClick={() => setMenu(false)} aria-label="סגירה"><Icon name="x" size={15} /></button>
+                <span className="mm-head-end">
+                  {user.unit_id != null && (
+                    <button className={`btn small ${favOnly ? 'fav-on' : ''}`} onClick={() => setFavOnly(!favOnly)} disabled={!model.favorites.size && !favOnly}
+                      title={model.favorites.size ? `המשימות ש${user.display_name} סימנו בכוכב` : 'עוד אין מועדפים. מסמנים בכוכב שבחלון הפרטים של משימה.'}>
+                      <Icon name="star" size={14} fill={favOnly ? 'currentColor' : undefined} /> {favOnly ? 'הצגת הכול' : 'הצגת מועדפים'}
+                    </button>
+                  )}
+                  <button className="icon-btn" onClick={closeMenu} aria-label="סגירה"><Icon name="x" size={15} /></button>
+                </span>
               </div>
               <div className="mm-cols">
                 <div className="mm-sec">
@@ -193,7 +263,8 @@ export function PresentView() {
         </div>
       </header>
 
-      <section className="meet-kpis" data-tour="m-kpis">
+      <section className={`meet-kpis ${kpiH != null && kpiH < 110 ? 'compact' : ''}`} data-tour="m-kpis" ref={kpiRef}
+        style={kpiH != null ? ({ height: kpiH, '--kz': Math.max(0.55, Math.min(1, kpiH / 150)) } as React.CSSProperties) : undefined}>
         <div className="mk">
           <span className="mk-label">התקדמות</span>
           <span className="mk-val">{kpi.pct}%</span>
@@ -219,8 +290,10 @@ export function PresentView() {
         </div>
       </section>
 
+      <div className="kpi-split" onPointerDown={startKpiDrag} onDoubleClick={() => setKpiH(null)} title="גרירה משנה את הגובה של המספרים מול ציר הזמן. לחיצה כפולה מחזירה לגודל הרגיל." />
+
       <Timeline rows={rows} today={model.data.today} onToggle={toggle} open={open} model={model} tourFocus={tourFocus}
-        onOpenTask={(from, id) => setStack([from, id])} />
+        onOpenTask={(from, id) => setStack(from === id ? [id] : [from, id])} />
       {stack.length > 0 && (
         <TaskDetails m={model} stack={stack} onOpen={(id) => setStack((st) => [...st, id])}
           onBack={() => setStack((st) => st.slice(0, -1))} onClose={() => setStack([])} />
@@ -228,8 +301,10 @@ export function PresentView() {
 
       <footer className="meet-legend">
         {(['ok', 'risk', 'late', 'done', 'idle'] as Light[]).map((l) => <span key={l} title={LIGHT_TIP[l]}><i className={`dot-l ${l}`} />{LIGHT_LABEL[l]}</span>)}
-        <span><svg width="16" height="16"><path d="M8 1l7 7-7 7-7-7z" fill="#1c2330" /></svg>אבן דרך</span>
-        <span className="muted">עמידה של שנייה על פס מציגה מה משפיע עליו ומה מושפע ממנו · לחיצה על שלב פותחת אותו</span>
+        <span><svg width="16" height="16"><path d="M8 1l7 7-7 7-7-7z" fill="var(--g-ms)" /></svg>אבן דרך</span>
+        <span className="legend-sep" />
+        <span className="how"><HowHover />עמידה של שנייה על פס: מה משפיע עליו ומה מושפע ממנו</span>
+        <span className="how"><HowClick />לחיצה על שם של שלב: פתיחת המשימות שבתוכו · לחיצה על פס: כרטיס המשימה</span>
       </footer>
     </div>
   );
@@ -298,6 +373,7 @@ function LinkStrip({ m, taskId, onOpen }: { m: Model; taskId: number; onOpen: (i
 function TaskDetails({ m, stack, onOpen, onBack, onClose }: {
   m: Model; stack: number[]; onOpen: (id: number) => void; onBack: () => void; onClose: () => void;
 }) {
+  const { user, toggleFavorite } = useApp();
   const id = stack[stack.length - 1];
   const t = m.task(id);
   useEffect(() => {
@@ -314,7 +390,15 @@ function TaskDetails({ m, stack, onOpen, onBack, onClose }: {
       <div className="td" key={id} onClick={(e) => e.stopPropagation()}>
         <div className="td-top">
           {prev ? <button className="btn" onClick={onBack}>› הקודם: {prev.name}</button> : <span />}
-          <button className="icon-btn" onClick={onClose} aria-label="סגירה"><Icon name="x" size={18} /></button>
+          <span className="td-tools">
+            {user.unit_id != null && (
+              <button className={`icon-btn star ${m.favorites.has(t.id) ? 'on' : ''}`} onClick={() => toggleFavorite(t.id)}
+                title={m.favorites.has(t.id) ? 'הסרה מהמועדפים' : `הוספה למועדפים של ${user.display_name}`}>
+                <Icon name="star" size={19} fill={m.favorites.has(t.id) ? 'currentColor' : undefined} />
+              </button>
+            )}
+            <button className="icon-btn" onClick={onClose} aria-label="סגירה"><Icon name="x" size={18} /></button>
+          </span>
         </div>
         <div className="td-path">{m.path(t.id)}</div>
         <h2 className="td-name">{t.kind === 'milestone' && <Icon name="diamond" size={18} />} {t.name}</h2>
@@ -435,7 +519,7 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
           const inside = bw > label.length * 8.6 + 26;
           return (
             <div key={r.key} className={`mt-row k-${r.kind} ${r.hasKids && r.taskId ? 'clickable' : ''} ${pop === i ? 'popped' : ''} ${tourFocus != null && r.taskId != null && (r.taskId === tourFocus || model.ancestors(r.taskId).includes(tourFocus)) ? 'tour-hl' : ''}`}
-              style={{ height: h }} onClick={() => onToggle(r)}>
+              style={{ height: h }} onClick={() => (r.hasKids || r.taskId == null ? onToggle(r) : onOpenTask(r.taskId, r.taskId))}>
               <div className="mt-name" style={{ width: NAME_W, paddingInlineStart: 16 + r.depth * 22 }}>
                 {r.kind === 'project' && <span className="mt-chip" style={{ background: r.color }} />}
                 {r.hasKids && r.taskId != null && <Icon name="chevronDown" size={16} className={`mt-tog ${isOpen ? '' : 'closed'}`} />}
@@ -445,12 +529,14 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
               <svg width={chartW} height={h} className="mt-chart">
                 {ticks.map((t, k) => <line key={k} x1={t.x1} x2={t.x1} y1={0} y2={h} className="mt-grid" />)}
                 {r.kind === 'milestone' ? (
-                  <g className="mt-hit" onMouseEnter={() => enterBar(i)} onMouseLeave={leave}>
+                  <g className="mt-hit" onMouseEnter={() => enterBar(i)} onMouseLeave={leave}
+                    onClick={(e) => { if (r.taskId != null) { e.stopPropagation(); clearTimeout(armTimer.current); setPop(null); onOpenTask(r.taskId, r.taskId); } }}>
                     <path transform={`translate(${left}, ${h / 2})`} d="M0,-13L13,0L0,13L-13,0Z" className={`mt-ms ${r.light}`} />
                     <text x={left - 20} y={h / 2} dy="0.35em" className="mt-label out">{`${r.name} · ${fmtDate(r.finish)}`}</text>
                   </g>
                 ) : (
-                  <g className="mt-hit" onMouseEnter={() => enterBar(i)} onMouseLeave={leave}>
+                  <g className="mt-hit" onMouseEnter={() => enterBar(i)} onMouseLeave={leave}
+                    onClick={(e) => { if (r.taskId != null) { e.stopPropagation(); clearTimeout(armTimer.current); setPop(null); onOpenTask(r.taskId, r.taskId); } }}>
                     <rect x={left} y={h * 0.2} width={bw} height={h * 0.6} rx={8} className={`mt-bar ${r.light}`} />
                     <rect x={right - (bw * r.pct) / 100} y={h * 0.2} width={(bw * r.pct) / 100} height={h * 0.6} rx={8} className={`mt-fill ${r.light}`} />
                     {inside
@@ -469,11 +555,20 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
           const { up, down } = directLinks(model, r.taskId!);
           let bR = x(toDay(r.start)), bL = x(toDay(r.finish) + 1);
           if (r.kind === 'milestone') { const c = bL; bR = c + 14; bL = c - 14; }
-          const CW = 236, CH = 92;
+          const CW = 236, CH = 92, GAP = 14;
           const cy = tops[pop] + heights[pop] / 2;
           const topFor = (n: number) => Math.max(4, Math.min(Math.max(4, total - n * CH - 4), cy - (n * CH) / 2));
-          const upLeft = Math.min(chartW - CW - 8, bR + 10);
-          const downLeft = Math.max(8, bL - 10 - CW);
+          // affecting cards right of the bar, affected cards left of it. They may float over the
+          // names column; near an edge they are pushed apart so the two stacks never touch.
+          let upLeft = Math.min(w - CW - 8, bR + 10);
+          let downLeft = Math.max(8, bL - 10 - CW);
+          if (up.length && down.length && upLeft < downLeft + CW + GAP) {
+            const need = downLeft + CW + GAP - upLeft;
+            const roomLeft = downLeft - 8, roomRight = w - CW - 8 - upLeft;
+            const toLeft = Math.min(roomLeft, Math.ceil(need / 2) + Math.max(0, Math.ceil(need / 2) - roomRight));
+            downLeft -= toLeft;
+            upLeft += need - toLeft;
+          }
           const open = (id: number) => { const from = r.taskId!; setPop(null); onOpenTask(from, id); };
           return (
             <div className="mt-float">
@@ -493,5 +588,35 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
       </div>
       {!rows.length && <p className="muted" style={{ padding: 30, textAlign: 'center' }}>אין מה להציג</p>}
     </div>
+  );
+}
+
+/** mouse pointer, drawn the way it looks on screen */
+const POINTER = 'M0,0 L0,13 L3.2,10 L5.6,15.2 L7.8,14.2 L5.5,9.2 L9.6,9.2 Z';
+
+/** legend picture: the pointer resting on a bar, with a small clock (one second) */
+function HowHover() {
+  return (
+    <svg width="46" height="26" viewBox="0 0 46 26" className="how-pic" aria-hidden="true">
+      <rect x="2" y="7" width="34" height="11" rx="4" fill="#c9ecd4" />
+      <rect x="18" y="7" width="18" height="11" rx="4" fill="#22a35a" />
+      <g transform="translate(15,10)"><path d={POINTER} fill="var(--g-ms)" stroke="var(--surface)" strokeWidth="1.2" strokeLinejoin="round" /></g>
+      <circle cx="39" cy="7" r="6" fill="var(--surface)" stroke="var(--text-2)" strokeWidth="1.4" />
+      <path d="M39 4v3.2l2 1.3" fill="none" stroke="var(--text-2)" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/** legend picture: a phase row clicked open, with the rows that appear under it */
+function HowClick() {
+  return (
+    <svg width="46" height="28" viewBox="0 0 46 28" className="how-pic" aria-hidden="true">
+      <rect x="1" y="1" width="44" height="11" rx="3" fill="var(--primary-soft)" stroke="var(--border-strong)" />
+      <path d="M36 5l3 3 3-3" fill="none" stroke="var(--g-ms)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="6" y="4.5" width="24" height="4" rx="2" fill="var(--muted)" />
+      <rect x="6" y="15" width="32" height="5" rx="2" fill="var(--g-faded)" />
+      <rect x="6" y="22" width="26" height="5" rx="2" fill="var(--g-faded)" />
+      <g transform="translate(24,6)"><path d={POINTER} fill="var(--g-ms)" stroke="var(--surface)" strokeWidth="1.2" strokeLinejoin="round" /></g>
+    </svg>
   );
 }

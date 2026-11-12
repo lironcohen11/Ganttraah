@@ -1,4 +1,4 @@
-# Gantraah - application image. Build on a machine with internet, then move to the closed network
+# Ganttraah - application image. Build on a machine with internet, then move to the closed network
 # with deploy/build-offline.ps1 (docker save / docker load).
 FROM node:24-alpine AS client
 WORKDIR /app/client

@@ -1,10 +1,10 @@
 // Demo backend: the whole API running inside the browser, for the single-file demo
-// (Gantraah-demo.html). The scheduling engine, Hebrew calendar and impact map are the
+// (Ganttraah-demo.html). The scheduling engine, Hebrew calendar and impact map are the
 // real server modules, imported as-is; data lives in this browser only (localStorage).
 // @ts-ignore - plain JS module shared with the server
 import { computeSchedule, diffSchedules, DEP_TYPES } from '../../../server/src/scheduler.js';
 // @ts-ignore
-import { toDay, fromDay, holidaysInRange, DEFAULT_CALENDAR } from '../../../server/src/calendar.js';
+import { toDay, fromDay, holidaysInRange, DEFAULT_CALENDAR, expandRanges } from '../../../server/src/calendar.js';
 // @ts-ignore
 import { impactGraph, simulate, taskPath } from '../../../server/src/impact.js';
 import seed from './seed.json';
@@ -16,9 +16,9 @@ class HttpError extends Error { constructor(public status: number, message: stri
 const KEY = 'gantraah.demo.v1';
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x));
 
-interface Core { projects: Any[]; tasks: Any[]; deps: Any[]; calendarSettings: Any; calendarExceptions: Any[] }
+interface Core { projects: Any[]; tasks: Any[]; deps: Any[]; calendarSettings: Any; specialDays: Any[] }
 interface Store extends Core {
-  units: Any[]; audit: Any[]; seq: Record<string, number>;
+  units: Any[]; audit: Any[]; seq: Record<string, number>; favorites: Record<string, number[]>; adminPassword?: string;
   undo: { label: string; core: Core }[]; redo: { label: string; core: Core }[];
 }
 
@@ -26,15 +26,29 @@ function fresh(): Store {
   const s = clone(seed) as Any;
   const max = (l: Any[]) => l.reduce((m, x) => Math.max(m, x.id), 0);
   return {
-    projects: s.projects, tasks: s.tasks, deps: s.deps, units: s.units,
-    calendarSettings: { ...DEFAULT_CALENDAR }, calendarExceptions: [],
+    projects: s.projects, tasks: s.tasks, deps: s.deps, units: s.units.map((u: Any) => ({ ...u, edit_all: false })),
+    calendarSettings: { ...DEFAULT_CALENDAR }, specialDays: [], favorites: {},
     audit: [{ id: 1, at: new Date().toISOString(), user_name: 'מערכת', entity: 'plan', action: 'create', summary: 'נטענו נתוני ההדגמה', details: {} }],
-    seq: { project: max(s.projects), task: max(s.tasks), dep: max(s.deps), audit: 1 },
+    seq: { project: max(s.projects), task: max(s.tasks), dep: max(s.deps), audit: 1, unit: max(s.units), special: 0 },
     undo: [], redo: [],
   };
 }
 let store: Store = (() => {
-  try { const v = localStorage.getItem(KEY); if (v) return JSON.parse(v); } catch { /* ignore */ }
+  try {
+    const v = localStorage.getItem(KEY);
+    if (v) {
+      const st = JSON.parse(v);
+      // a demo saved by an older version: single-day exceptions become special days
+      if (!st.specialDays) {
+        st.specialDays = (st.calendarExceptions || []).map((e: Any, i: number) => ({ id: i + 1, unit_id: null, start_day: e.day, end_day: e.day, kind: e.kind, label: e.label || '' }));
+        delete st.calendarExceptions;
+      }
+      st.favorites = st.favorites || {};
+      st.seq.unit = st.seq.unit || st.units.reduce((m: number, u: Any) => Math.max(m, u.id), 0);
+      st.seq.special = st.seq.special || st.specialDays.length;
+      return st;
+    }
+  } catch { /* ignore */ }
   return fresh();
 })();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch { /* storage full or blocked */ } };
@@ -47,14 +61,18 @@ function currentUser() {
   const id = getUnitId();
   const u = store.units.find((x) => x.id === id);
   if (!u) return null;
-  return { id: u.id, unit_id: u.id, username: `unit-${u.id}`, display_name: u.name, head: '', kind: u.kind, role: u.parent_id == null ? 'admin' : 'editor', active: true };
+  return { id: u.id, unit_id: u.id, username: `unit-${u.id}`, display_name: u.name, head: '', kind: u.kind, role: u.parent_id == null ? 'admin' : 'editor', active: true, edit_all: !!u.edit_all };
 }
 
 // ---- schedule helpers
 const todayISO = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
-const data = () => ({ ...store, today: todayISO() });
+const data = () => ({
+  ...store, today: todayISO(),
+  calendarSettings: { ...store.calendarSettings, workDays: DEFAULT_CALENDAR.workDays },
+  calendarExceptions: expandRanges(store.specialDays.filter((r) => r.unit_id == null)),
+});
 const sched = () => computeSchedule(data());
-const core = (): Core => clone({ projects: store.projects, tasks: store.tasks, deps: store.deps, calendarSettings: store.calendarSettings, calendarExceptions: store.calendarExceptions });
+const core = (): Core => clone({ projects: store.projects, tasks: store.tasks, deps: store.deps, calendarSettings: store.calendarSettings, specialDays: store.specialDays });
 const restore = (c: Core) => { Object.assign(store, clone(c)); };
 
 // ---- permissions (same rules as server/src/units.js)
@@ -68,7 +86,7 @@ const effOwner = (s: Any, id: number | null) => {
   return null;
 };
 function mustEdit(user: Any, s: Any, taskId: number, what = 'לערוך את המשימה הזו') {
-  if (user.role === 'admin') return;
+  if (user.role === 'admin' || user.edit_all) return;
   const o = effOwner(s, taskId);
   if (o != null && isWithin(o, user.unit_id)) return;
   const name = store.units.find((u) => u.id === o)?.name;
@@ -76,6 +94,7 @@ function mustEdit(user: Any, s: Any, taskId: number, what = 'לערוך את ה�
 }
 function mustAssign(user: Any, ownerId: number | null) {
   if (user.role === 'admin') return;
+  if (user.edit_all && ownerId != null) return;
   if (ownerId == null) throw new HttpError(403, 'רק הנהלת הענף יכולה להשאיר משימה בלי אחראי.');
   if (!isWithin(ownerId, user.unit_id)) throw new HttpError(403, 'אפשר להעביר אחריות רק ליחידה שלך או ליחידות שמתחתיה.');
 }
@@ -121,6 +140,7 @@ on('GET', /^\/units$/, () => store.units, 'public');
 on('POST', /^\/enter$/, (_u, b) => {
   const u = store.units.find((x) => x.id === Number(b.unit_id));
   if (!u) throw new HttpError(400, 'היחידה לא נמצאה');
+  if (u.parent_id == null && String(b.password ?? '') !== (store.adminPassword || 'ליורד')) throw new HttpError(403, 'הסיסמה שגויה');
   setUnitId(u.id);
   return { user: currentUser() };
 }, 'public');
@@ -143,6 +163,8 @@ on('GET', /^\/data$/, () => {
     today: d.today, projects: [...s.projects.values()], tasks: tasks.map(({ _ES, _EF, ...t }: Any) => t),
     dependencies: s.validDeps, calendar: { workDays: d.calendarSettings.workDays, days }, cycle: s.cycle, db: 'demo',
     undo: { undo: top(store.undo), redo: top(store.redo) }, units: store.units,
+    unitDays: store.specialDays.filter((r) => r.unit_id != null && r.kind !== 'work'),
+    favorites: ((store.favorites[String(getUnitId())] || []) as number[]).filter((id) => s.tasks.has(id)),
   };
 }, 'viewer');
 
@@ -204,6 +226,8 @@ on('POST', /^\/projects\/(\d+)\/baseline$/, (user, _b, m) => {
       const raw = store.tasks.find((x) => x.id === t.id);
       raw.baseline_start = t.start; raw.baseline_finish = t.finish;
     }
+    const pr = store.projects.find((x) => x.id === id);
+    if (pr) pr.baseline_at = new Date().toISOString();
     return { action: 'baseline', projectId: id, summary: 'נשמר התכנון המקורי' };
   });
   return { ok: true };
@@ -222,6 +246,7 @@ on('POST', /^\/tasks$/, (user, b) => {
   return mutate(user, () => {
     let sort = null;
     if (b.after_id != null) { const a = store.tasks.find((t) => t.id === int(b.after_id, 0)); if (a && (a.parent_id ?? null) === parentId) sort = a.sort_order + 5; }
+    if (sort == null && b.first) sort = Math.min(0, ...store.tasks.filter((t) => t.project_id === projectId && (t.parent_id ?? null) === parentId).map((t) => t.sort_order)) - 10;
     if (sort == null) sort = Math.max(0, ...store.tasks.filter((t) => t.project_id === projectId && (t.parent_id ?? null) === parentId).map((t) => t.sort_order)) + 10;
     const t = {
       id: ++store.seq.task, project_id: projectId, parent_id: parentId, sort_order: sort, name, kind,
@@ -359,50 +384,168 @@ on('POST', /^\/simulate$/, (_u, b) => {
 }, 'viewer');
 
 // history
-on('GET', /^\/history$/, (_u, _b, _m, q) => {
-  let rows = store.audit;
+// same rules as the server: one year back, filtered here, newest first, "before" for the next page
+const HISTORY_DAYS = 365;
+const historyRows = (q: URLSearchParams) => {
+  const from = Date.now() - HISTORY_DAYS * 86400000;
+  let rows = store.audit.filter((r) => Date.parse(r.at) >= from);
   if (q.get('task_id')) rows = rows.filter((r) => r.task_id === Number(q.get('task_id')));
   if (q.get('project_id')) rows = rows.filter((r) => r.project_id === Number(q.get('project_id')));
-  return rows.slice(0, Number(q.get('limit') || 200));
+  if (q.get('user')) rows = rows.filter((r) => r.user_name === q.get('user'));
+  if (q.get('action')) rows = rows.filter((r) => r.action === q.get('action'));
+  return rows;
+};
+on('GET', /^\/history$/, (_u, _b, _m, q) => {
+  let rows = historyRows(q);
+  if (q.get('before')) rows = rows.filter((r) => r.id < Number(q.get('before')));
+  return rows.slice(0, Math.min(1000, Number(q.get('limit') || 200)));
+}, 'viewer');
+on('GET', /^\/history\/meta$/, (_u, _b, _m, q) => {
+  const all = historyRows(new URLSearchParams());
+  return { count: historyRows(q).length, people: [...new Set(all.map((r) => r.user_name).filter(Boolean))], actions: [...new Set(all.map((r) => r.action))], days: HISTORY_DAYS };
 }, 'viewer');
 
-// calendar
+// calendar and special days (same rules as server/src/api.js)
 on('GET', /^\/calendar$/, (_u, _b, _m, q) => {
   const year = Number(q.get('year')) || Number(todayISO().slice(0, 4));
   const s = computeSchedule({ ...data(), tasks: [], deps: [] });
   const holidays = holidaysInRange(toDay(`${year}-01-01`), toDay(`${year}-12-31`)).map((h: Any) => ({ ...h, off: !s.cal.isWork(toDay(h.day)) }));
-  return { settings: store.calendarSettings, defaults: DEFAULT_CALENDAR, exceptions: store.calendarExceptions, holidays, year };
+  return { settings: data().calendarSettings, defaults: DEFAULT_CALENDAR, specialDays: store.specialDays, holidays, year };
 }, 'viewer');
 on('PUT', /^\/calendar$/, (user, b) => {
   needAdmin(user);
   mutate(user, () => {
-    store.calendarSettings = { workDays: (b.workDays || []).map(Number), chagOff: !!b.chagOff, independenceOff: !!b.independenceOff, cholHamoedOff: !!b.cholHamoedOff, erevChagOff: !!b.erevChagOff };
-    return { action: 'update', summary: 'עודכנו הגדרות לוח העבודה' };
+    store.calendarSettings = { workDays: DEFAULT_CALENDAR.workDays, chagOff: !!b.chagOff, independenceOff: !!b.independenceOff, cholHamoedOff: !!b.cholHamoedOff, erevChagOff: !!b.erevChagOff };
+    return { action: 'update', summary: 'עודכנו הגדרות החגים' };
   });
   return { ok: true };
 });
-on('POST', /^\/calendar\/exceptions$/, (user, b) => {
-  needAdmin(user);
+on('POST', /^\/calendar\/special$/, (user, b) => {
+  if (!b.start_day || !isDate(b.start_day)) throw new HttpError(400, 'תאריך לא תקין');
+  const end = b.end_day && isDate(b.end_day) && b.end_day >= b.start_day ? b.end_day : b.start_day;
+  let unitId = b.unit_id == null || b.unit_id === '' ? null : int(b.unit_id, null);
+  const root = store.units.find((u) => u.parent_id == null);
+  if (unitId === root?.id) unitId = null;
+  if (user.role !== 'admin') {
+    if (unitId == null) unitId = user.unit_id;
+    if (!isWithin(unitId, user.unit_id)) throw new HttpError(403, 'אפשר להוסיף ימים מיוחדים רק למסגרת שלך או למסגרות שמתחתיה.');
+  }
+  if (b.kind === 'work' && unitId != null) throw new HttpError(400, 'יום עבודה מיוחד אפשר להגדיר רק לכל הענף');
+  const kind = b.kind === 'work' ? 'work' : 'off';
   mutate(user, () => {
-    store.calendarExceptions = store.calendarExceptions.filter((e) => e.day !== b.day);
-    store.calendarExceptions.push({ day: b.day, kind: b.kind === 'work' ? 'work' : 'off', label: String(b.label || '') });
-    return { action: 'update', summary: `${b.day} הוגדר כיום ${b.kind === 'work' ? 'עבודה' : 'חופש'}` };
+    store.specialDays.push({ id: ++store.seq.special, unit_id: unitId, start_day: b.start_day, end_day: end, kind, label: String(b.label || '') });
+    const who = unitId == null ? 'כל הענף' : store.units.find((u) => u.id === unitId)?.name;
+    return { action: 'create', summary: `${b.start_day === end ? b.start_day : `${b.start_day} עד ${end}`}: ${kind === 'work' ? 'יום עבודה' : 'יום חופש'} ל${who}` };
   });
   return { ok: true };
 });
-on('DELETE', /^\/calendar\/exceptions\/([\d-]+)$/, (user, _b, m) => {
-  needAdmin(user);
-  mutate(user, () => { store.calendarExceptions = store.calendarExceptions.filter((e) => e.day !== m[1]); return { action: 'delete', summary: 'בוטלה חריגה בלוח העבודה' }; });
+on('DELETE', /^\/calendar\/special\/(\d+)$/, (user, _b, m) => {
+  const r = store.specialDays.find((x) => x.id === Number(m[1]));
+  if (!r) throw new HttpError(404, 'היום המיוחד לא נמצא');
+  if (user.role !== 'admin' && (r.unit_id == null || !isWithin(r.unit_id, user.unit_id))) throw new HttpError(403, 'אפשר להסיר רק ימים מיוחדים של המסגרת שלך או של המסגרות שמתחתיה.');
+  mutate(user, () => { store.specialDays = store.specialDays.filter((x) => x !== r); return { action: 'delete', summary: 'הוסר יום מיוחד' }; });
   return { ok: true };
 });
 
-// organisation units (rename)
+on('PUT', /^\/admin-password$/, (user, b) => {
+  needAdmin(user);
+  if (String(b.next ?? '').trim().length < 4) throw new HttpError(400, 'הסיסמה החדשה קצרה מדי (לפחות 4 תווים)');
+  store.adminPassword = String(b.next);
+  save();
+  return { ok: true };
+});
+
+// import from a file (same rules as server/src/api.js)
+on('POST', /^\/import$/, (user, b) => {
+  const rows: Any[] = Array.isArray(b.tasks) ? b.tasks.slice(0, 3000) : [];
+  if (!rows.length) throw new HttpError(400, 'אין משימות לייבוא');
+  if (b.new_project && user.role !== 'admin') throw new HttpError(403, 'רק הנהלת הענף יכולה ליצור פרויקט חדש.');
+  const owners = rows.map((r) => { let o = r.owner_unit_id == null ? null : int(r.owner_unit_id, null); if (o != null && !store.units.some((u) => u.id === o)) o = null; if (o == null && user.role !== 'admin') o = user.unit_id; mustAssign(user, o); return o; });
+  return mutate(user, () => {
+    let projectId = int(b.project_id, null);
+    if (b.new_project) {
+      const p = { id: ++store.seq.project, name: String(b.new_project.name || 'פרויקט מיובא'), description: 'יובא מקובץ', color: '#3b6fd8', start_date: b.new_project.start_date, sort_order: store.projects.length + 1 };
+      store.projects.push(p); projectId = p.id;
+    }
+    const proj = store.projects.find((x) => x.id === projectId);
+    if (!proj) throw new HttpError(404, 'הפרויקט לא נמצא');
+    const idOf = new Map<string, number>();
+    rows.forEach((r, i) => {
+      const name = String(r.name || '').trim();
+      if (!name) return;
+      const parentId = r.parent_key != null && idOf.has(String(r.parent_key)) ? idOf.get(String(r.parent_key))! : null;
+      const kind = r.kind === 'milestone' ? 'milestone' : 'task';
+      const t = { id: ++store.seq.task, project_id: projectId, parent_id: parentId, sort_order: (i + 1) * 10 + 100000, name, kind,
+        duration: kind === 'milestone' ? 0 : Math.max(1, int(r.duration, 1)), start_constraint: isDate(r.start) && r.start ? r.start : null,
+        percent: Math.max(0, Math.min(100, int(r.percent, 0))), owner: '', notes: String(r.notes || ''), deadline: kind !== 'milestone' && isDate(r.deadline) && r.deadline ? r.deadline : null,
+        cost: null, baseline_start: null, baseline_finish: null, owner_unit_id: owners[i] };
+      store.tasks.push(t); idOf.set(String(r.key), t.id);
+    });
+    let deps = 0;
+    for (const d of Array.isArray(b.deps) ? b.deps : []) {
+      const pId = idOf.get(String(d.from)), sId = idOf.get(String(d.to));
+      if (pId == null || sId == null || pId === sId || store.deps.some((x) => (x.predecessor_id === pId && x.successor_id === sId) || (x.predecessor_id === sId && x.successor_id === pId))) continue;
+      store.deps.push({ id: ++store.seq.dep, predecessor_id: pId, successor_id: sId, type: DEP_TYPES.includes(d.type) ? d.type : 'FS', lag: int(d.lag, 0) }); deps++;
+    }
+    return { result: { project_id: projectId, tasks: idOf.size, deps }, action: 'create', projectId: projectId!, summary: `יובאו ${idOf.size} משימות מקובץ אל "${proj.name}"` };
+  }).result;
+});
+
+// favourites, kept per unit
+on('POST', /^\/favorites$/, (user, b) => {
+  const key = String(user.unit_id);
+  const list = new Set<number>(store.favorites[key] || []);
+  if (b.on === false) list.delete(int(b.task_id, 0)); else list.add(int(b.task_id, 0));
+  store.favorites[key] = [...list];
+  save();
+  return { ok: true };
+});
+
+// organisation units and permissions (branch management only)
+const subtreeUnits = (id: number) => { const out = new Set([id]); let grew = true; while (grew) { grew = false; for (const u of store.units) if (u.parent_id != null && out.has(u.parent_id) && !out.has(u.id)) { out.add(u.id); grew = true; } } return out; };
+const depthOf = (id: number | null) => { let d = 0; let x = store.units.find((u) => u.id === id)?.parent_id ?? null; while (x != null && d < 50) { d++; x = store.units.find((u) => u.id === x)?.parent_id ?? null; } return d; };
+const kindAt = (d: number) => (d === 0 ? 'branch' : d === 1 ? 'section' : 'team');
+const unitLog = (user: Any, summary: string) => { store.audit.unshift({ id: ++store.seq.audit, at: new Date().toISOString(), user_name: user.display_name, entity: 'unit', action: 'update', summary, details: {} }); save(); };
+on('POST', /^\/units$/, (user, b) => {
+  needAdmin(user);
+  const parent = store.units.find((u) => u.id === int(b.parent_id, null));
+  const name = String(b.name || '').trim();
+  if (!parent || !name) throw new HttpError(400, 'חסר שם או מסגרת אם');
+  const u = { id: ++store.seq.unit, parent_id: parent.id, kind: kindAt(depthOf(parent.id) + 1), name, head: '', sort_order: store.units.filter((x) => x.parent_id === parent.id).length, edit_all: false };
+  store.units.push(u);
+  unitLog(user, `נוספה מסגרת "${name}" תחת "${parent.name}"`);
+  return u;
+});
 on('PATCH', /^\/units\/(\d+)$/, (user, b, m) => {
   needAdmin(user);
   const u = store.units.find((x) => x.id === Number(m[1]));
-  if (!u) throw new HttpError(404, 'היחידה לא נמצאה');
+  if (!u) throw new HttpError(404, 'המסגרת לא נמצאה');
   if (b.name != null && String(b.name).trim()) u.name = String(b.name).trim();
-  save();
+  if ('edit_all' in b) { if (u.parent_id == null) throw new HttpError(400, 'הנהלת הענף עורכת הכול ממילא'); u.edit_all = !!b.edit_all; }
+  if ('parent_id' in b && int(b.parent_id, null) !== u.parent_id) {
+    const np = int(b.parent_id, null);
+    if (u.parent_id == null || !store.units.some((x) => x.id === np)) throw new HttpError(400, 'אי אפשר להעביר לשם');
+    if (subtreeUnits(u.id).has(np)) throw new HttpError(400, 'אי אפשר להעביר מסגרת אל תוך עצמה');
+    u.parent_id = np;
+    u.sort_order = store.units.filter((x) => x.parent_id === np).length;
+    for (const x of subtreeUnits(u.id)) { const y = store.units.find((z) => z.id === x)!; y.kind = kindAt(depthOf(x)); }
+  }
+  unitLog(user, `עודכנה מסגרת "${u.name}"`);
+  return { ok: true };
+});
+on('DELETE', /^\/units\/(\d+)$/, (user, _b, m) => {
+  needAdmin(user);
+  const u = store.units.find((x) => x.id === Number(m[1]));
+  if (!u) throw new HttpError(404, 'המסגרת לא נמצאה');
+  if (u.parent_id == null) throw new HttpError(400, 'אי אפשר למחוק את הנהלת הענף');
+  const sub = subtreeUnits(u.id);
+  const s = sched();
+  const open = [...s.tasks.values()].filter((t: Any) => t.owner_unit_id != null && sub.has(t.owner_unit_id) && t.percent < 100);
+  if (open.length) throw new HttpError(400, `אי אפשר למחוק: יש ${open.length} משימות פתוחות באחריות המסגרת או מתחתיה.`);
+  for (const t of store.tasks) if (t.owner_unit_id != null && sub.has(t.owner_unit_id)) t.owner_unit_id = u.parent_id;
+  store.units = store.units.filter((x) => !sub.has(x.id));
+  store.specialDays = store.specialDays.filter((r) => r.unit_id == null || !sub.has(r.unit_id));
+  unitLog(user, `נמחקה מסגרת "${u.name}"`);
   return { ok: true };
 });
 

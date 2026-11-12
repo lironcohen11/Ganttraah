@@ -20,6 +20,8 @@ export interface Ctx {
   setSim: (s: SimOverlay | null) => void;
   undoRedo: (kind: 'undo' | 'redo') => void;
   sim: SimOverlay | null;
+  /** add / remove a task from the favourites of the unit you entered as */
+  toggleFavorite: (id: number) => void;
 }
 
 export interface SimOverlay {

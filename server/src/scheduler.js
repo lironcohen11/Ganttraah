@@ -92,6 +92,30 @@ export function computeSchedule(data) {
   const isMs = (n) => n.kind === 'milestone' && !n.children.length;
   const dur = (n) => (isMs(n) ? 0 : Math.max(1, n.duration | 0));
 
+  // ---- special days of a unit: they apply to its tasks and to tasks of the units below it.
+  // Kept as work-day indices of the shared calendar that this unit does not work on.
+  const unitParent = new Map((data.units || []).map((u) => [u.id, u.parent_id]));
+  const unitRanges = (data.specialDays || []).filter((r) => r.unit_id != null && r.kind !== 'work');
+  const offCache = new Map();
+  const unitOff = (unitId) => {
+    if (unitId == null || !unitRanges.length) return null;
+    if (offCache.has(unitId)) return offCache.get(unitId);
+    const chain = new Set();
+    for (let x = unitId, i = 0; x != null && i < 50; i++) { chain.add(x); x = unitParent.get(x) ?? null; }
+    const set = new Set();
+    for (const r of unitRanges) {
+      if (!chain.has(r.unit_id)) continue;
+      for (let d = toDay(r.start_day); d <= toDay(r.end_day); d++) if (cal.isWork(d)) set.add(cal.idxOf(d));
+    }
+    const v = set.size ? set : null;
+    offCache.set(unitId, v);
+    return v;
+  };
+  const ownerOf = (n) => {
+    for (let x = n, i = 0; x && i < 100; i++) { if (x.owner_unit_id != null) return x.owner_unit_id; x = x.parent_id != null ? node.get(x.parent_id) : null; }
+    return null;
+  };
+
   // ---- forward pass
   for (const id of order) {
     const n = node.get(id);
@@ -120,10 +144,19 @@ export function computeSchedule(data) {
       reqs.push({ depId: dep.id, req });
       if (req > es) es = req;
     }
-    n.ES = es;
-    n.EF = ms ? es : es + D - 1;
     n.drivingDepIds = es > base ? reqs.filter((r) => r.req === es).map((r) => r.depId) : [];
     n.constrained = !!n.start_constraint && es === base;
+    // the owner unit's special days: start after them, and do not count them as work
+    const off = unitOff(ownerOf(n));
+    if (off) {
+      while (off.has(es)) es++;
+      let ef = es;
+      for (let left = ms ? 0 : D - 1; left > 0;) { ef++; if (!off.has(ef)) left--; }
+      n.ES = es; n.EF = ef;
+    } else {
+      n.ES = es;
+      n.EF = ms ? es : es + D - 1;
+    }
   }
 
   // ---- progress, cost and driving roll-up (children before parents: reuse order)
@@ -163,10 +196,10 @@ export function computeSchedule(data) {
     }
     const pf = projFinish.get(n.project_id);
     if (n.children.length) { n.LFb = Math.min(lfB.get(id) ?? Infinity, pf); continue; }
-    const D = dur(n);
     const ms = isMs(n);
-    let LF = Math.min(pf, lfB.get(id) ?? Infinity, (lsB.get(id) ?? Infinity) + (ms ? 0 : D - 1));
-    const LS = ms ? LF : LF - (D - 1);
+    const span1 = ms ? 0 : n.EF - n.ES; // length in shared work days (longer when the unit has special days)
+    let LF = Math.min(pf, lfB.get(id) ?? Infinity, (lsB.get(id) ?? Infinity) + span1);
+    const LS = LF - span1;
     n.LS = LS; n.LF = LF;
     n.float = LS - n.ES;
     for (const { dep, direct } of incoming.get(id)) {
@@ -223,7 +256,7 @@ export function computeSchedule(data) {
       baseline_finish: n.baseline_finish,
       start,
       finish,
-      work_days: span,
+      work_days: n.children.length ? span : (isMs(n) ? 0 : dur(n)),
       wbs: n.wbs,
       level: n.level,
       children: n.children,

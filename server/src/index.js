@@ -1,4 +1,4 @@
-// Gantraah server entry point.
+// Ganttraah server entry point.
 import './env.js';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -9,9 +9,9 @@ import { WebSocketServer } from 'ws';
 import { initDb, db } from './db.js';
 import { api } from './api.js';
 import { ensureAdmin, userFromCookieHeader } from './auth.js';
-import { onChange } from './store.js';
+import { onChange, pruneHistory, HISTORY_DAYS } from './store.js';
 import { seedDemoIfEmpty } from './seed.js';
-import { ensureUnits, migrateOwners, restructureUnits } from './units.js';
+import { ensureUnits, migrateOwners, restructureUnits, migrateSpecialDays } from './units.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8080);
@@ -32,6 +32,15 @@ if (await ensureUnits()) console.log('[gantraah] example organisation structure 
 { const r = await restructureUnits(); if (r?.length) console.log('[gantraah] organisation updated:', r.join(', ')); }
 if (process.env.SEED_DEMO === 'true' && (await seedDemoIfEmpty())) console.log('[gantraah] demo data loaded');
 { const n = await migrateOwners(); if (n) console.log(`[gantraah] ${n} task owners converted to units`); }
+{ const n = await migrateSpecialDays(); if (n) console.log(`[gantraah] ${n} special days moved to the new table`); }
+// projects whose original plan was saved before 1.5.1: take the date from the history
+await db.query("UPDATE projects p SET baseline_at = (SELECT max(at) FROM audit_log a WHERE a.action='baseline' AND a.project_id=p.id) WHERE baseline_at IS NULL");
+// history older than a year is deleted now, and then once a day
+const prune = () => pruneHistory()
+  .then((n) => { if (n) console.log(`[gantraah] ${n} history entries older than ${HISTORY_DAYS} days deleted`); })
+  .catch((e) => console.error('[gantraah] history cleanup failed:', e.message));
+await prune();
+setInterval(prune, 24 * 3600 * 1000).unref();
 
 const app = express();
 app.disable('x-powered-by');
@@ -46,7 +55,7 @@ if (fs.existsSync(STATIC_DIR)) {
     res.sendFile(path.join(STATIC_DIR, 'index.html'));
   });
 } else {
-  app.get('/', (_req, res) => res.send('Gantraah server is running. Client build not found at ' + STATIC_DIR));
+  app.get('/', (_req, res) => res.send('Ganttraah server is running. Client build not found at ' + STATIC_DIR));
 }
 
 const server = http.createServer(app);

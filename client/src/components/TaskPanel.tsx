@@ -7,10 +7,12 @@ import { fmtDate, fmtDateTime, toDay, daysText } from '../dates';
 import { Icon } from './Icon';
 import { TaskPicker } from './TaskPicker';
 
-function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: React.ReactNode }) {
+const DEADLINE_INFO = 'מועד חיצוני שהמשימה חייבת לעמוד בו, למשל התחייבות ללקוח. בניגוד לתאריך הסיום, שמחושב לבד וזז עם התלויות, תאריך היעד קבוע ולא זז. אם הסיום עובר אותו, המשימה מסומנת באדום.';
+
+function Field({ label, children, hint, info }: { label: string; children: React.ReactNode; hint?: React.ReactNode; info?: string }) {
   return (
     <label className="field">
-      <span className="f-label">{label}</span>
+      <span className="f-label">{label}{info && <span className="f-info" title={info}><Icon name="info" size={13} /></span>}</span>
       {children}
       {hint && <span className="f-hint">{hint}</span>}
     </label>
@@ -33,7 +35,7 @@ function Commit({ value, onCommit, type = 'text', disabled, min, max, className,
 }
 
 export function TaskPanel({ taskId, onClose }: { taskId: number; onClose: () => void }) {
-  const { model, canEdit, canEditTask, assignable, isAdmin, run, focusTask, openTask } = useApp();
+  const { model, user, canEdit, canEditTask, assignable, isAdmin, run, focusTask, openTask, toggleFavorite } = useApp();
   const t = model.task(taskId);
   const [history, setHistory] = useState<AuditEntry[]>([]);
   const [notes, setNotes] = useState(t?.notes || '');
@@ -124,6 +126,12 @@ export function TaskPanel({ taskId, onClose }: { taskId: number; onClose: () => 
           <span>{pr.name}</span>
           {anc.map((a) => <span key={a} className="crumb-sep">›<button onClick={() => openTask(a)}>{model.task(a)!.name}</button></span>)}
         </div>
+        {user.unit_id != null && (
+          <button className={`icon-btn star ${model.favorites.has(t.id) ? 'on' : ''}`} onClick={() => toggleFavorite(t.id)}
+            title={model.favorites.has(t.id) ? 'הסרה מהמועדפים' : `הוספה למועדפים של ${user.display_name}`}>
+            <Icon name="star" size={17} fill={model.favorites.has(t.id) ? 'currentColor' : undefined} />
+          </button>
+        )}
         <button className="icon-btn" onClick={onClose} aria-label="סגור"><Icon name="x" /></button>
       </div>
 
@@ -185,7 +193,7 @@ export function TaskPanel({ taskId, onClose }: { taskId: number; onClose: () => 
                 </Field>
               </>}
               {t.kind !== 'milestone' && (
-                <Field label="תאריך יעד" hint={t.deadline_missed ? <span className="bad">הסיום המתוכנן ({fmtDate(t.finish)}) מאוחר מתאריך היעד</span> : null}>
+                <Field label="תאריך יעד" info={DEADLINE_INFO} hint={t.deadline_missed ? <span className="bad">הסיום המתוכנן ({fmtDate(t.finish)}) מאוחר מתאריך היעד</span> : null}>
                   <div className="with-clear">
                     <Commit type="date" value={t.deadline || ''} disabled={!ed} onCommit={(v) => save({ deadline: v || null })} />
                     {t.deadline && ed && <button className="icon-btn" title="הסר" onClick={() => save({ deadline: null })}><Icon name="x" size={13} /></button>}
@@ -195,7 +203,7 @@ export function TaskPanel({ taskId, onClose }: { taskId: number; onClose: () => 
             </div>
           )}
           {isSummary && (
-            <Field label="תאריך יעד" hint={t.deadline_missed ? <span className="bad">הסיום המתוכנן מאוחר מתאריך היעד</span> : null}>
+            <Field label="תאריך יעד" info={DEADLINE_INFO} hint={t.deadline_missed ? <span className="bad">הסיום המתוכנן מאוחר מתאריך היעד</span> : null}>
               <div className="with-clear">
                 <Commit type="date" value={t.deadline || ''} disabled={!ed} onCommit={(v) => save({ deadline: v || null })} />
                 {t.deadline && ed && <button className="icon-btn" title="הסר" onClick={() => save({ deadline: null })}><Icon name="x" size={13} /></button>}
@@ -226,10 +234,11 @@ export function TaskPanel({ taskId, onClose }: { taskId: number; onClose: () => 
             </div>
           ) : (
             <div className="prog">
-              <input type="range" min={0} max={100} step={5} disabled={!ed}
-                onPointerUp={(e) => save({ percent: Number((e.target as HTMLInputElement).value) })}
-                onKeyUp={(e) => save({ percent: Number((e.target as HTMLInputElement).value) })}
-                style={{ accentColor: pr.color }} key={t.own_percent} defaultValue={t.own_percent} />
+              <div className="pct-steps" role="group" aria-label="התקדמות">
+                {[0, 25, 50, 75, 100].map((v) => (
+                  <button key={v} className={t.own_percent === v ? 'on' : ''} disabled={!ed} onClick={() => t.own_percent !== v && save({ percent: v })}>{v}%</button>
+                ))}
+              </div>
               <Commit type="number" min={0} max={100} className="pct-input" value={t.own_percent} disabled={!ed} onCommit={(v) => save({ percent: Number(v) || 0 })} />
               <span>%</span>
             </div>
@@ -292,7 +301,7 @@ export function TaskPanel({ taskId, onClose }: { taskId: number; onClose: () => 
         </section>
 
         <div className="actions-row">
-          <button className="btn primary" onClick={() => focusTask(t.id)}><Icon name="focus" size={15} /> פתיחה במפת השפעות ומה-אם</button>
+          <button className="btn primary" onClick={() => focusTask(t.id)}><Icon name="deps" size={15} /> פתיחה במפת התלויות ומה-אם</button>
           <p className="muted small">כל השרשרת של המשימה במסך אחד, והדמיה של מה יקרה אם היא תתעכב.</p>
         </div>
 

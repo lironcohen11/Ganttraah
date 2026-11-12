@@ -12,7 +12,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $out = Join-Path $PSScriptRoot "out"
 $stage = Join-Path $out "gantraah-$Version"
 
-Write-Host "== Gantraah offline package $Version"
+Write-Host "== Ganttraah offline package $Version"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
@@ -20,13 +20,14 @@ Write-Host "-- building client"
 Push-Location (Join-Path $root "client")
 npm ci --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { throw "client npm ci failed" }
-npm run build
+# build straight into the package: client\dist is what a running local server serves, so it is left alone
+npx vite build --outDir (Join-Path $stage "client\dist") --emptyOutDir
 if ($LASTEXITCODE -ne 0) { throw "client build failed" }
-Write-Host "-- building the single-file demo (Gantraah-demo.html)"
+Write-Host "-- building the single-file demo (Ganttraah-demo.html)"
 npm run build:demo
 if ($LASTEXITCODE -ne 0) { throw "demo build failed" }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
-Copy-Item "dist-demo\index.html" (Join-Path $out "Gantraah-demo.html") -Force
+Copy-Item "dist-demo\index.html" (Join-Path $out "Ganttraah-demo.html") -Force
 Pop-Location
 
 Write-Host "-- staging server with production dependencies"
@@ -39,8 +40,6 @@ npm ci --omit=dev --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { throw "server npm ci failed" }
 Pop-Location
 
-New-Item -ItemType Directory -Force -Path (Join-Path $stage "client") | Out-Null
-Copy-Item -Recurse (Join-Path $root "client\dist") (Join-Path $stage "client\dist")
 Copy-Item (Join-Path $root ".env.example") $stage
 Copy-Item (Join-Path $root "README.md") $stage
 Copy-Item -Recurse (Join-Path $root "docs") (Join-Path $stage "docs")

@@ -33,7 +33,7 @@ export function parseCookies(header = '') {
 
 export const publicUser = (u) => u && ({
   id: u.id, username: u.username, display_name: u.display_name, role: u.role, active: u.active,
-  unit_id: u.unit_id ?? null, head: u.head ?? '', kind: u.kind ?? 'account',
+  unit_id: u.unit_id ?? null, head: u.head ?? '', kind: u.kind ?? 'account', edit_all: !!u.edit_all,
 });
 
 export async function login(username, password) {
@@ -52,12 +52,25 @@ export function sessionCookie(token, expires) {
 }
 export const clearCookie = () => `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 
-/** Enter the system as an organisation unit (or view-only). No password, by design. */
-export async function enterAsUnit(unitId, viewOnly) {
+// Branch management (the root unit) enters with a password; every other unit enters without one.
+export const DEFAULT_ADMIN_PASSWORD = 'ליורד';
+export async function checkAdminPassword(pw) {
+  const row = (await db.query("SELECT value FROM settings WHERE key='admin_password'"))[0];
+  const stored = row ? (typeof row.value === 'string' ? row.value : row.value?.hash) : null;
+  return stored ? verifyPassword(pw ?? '', stored) : String(pw ?? '') === DEFAULT_ADMIN_PASSWORD;
+}
+export async function setAdminPassword(pw) {
+  await db.query(`INSERT INTO settings (key, value) VALUES ('admin_password', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [JSON.stringify({ hash: hashPassword(pw) })]);
+}
+
+/** Enter the system as an organisation unit (or view-only). Only branch management has a password. */
+export async function enterAsUnit(unitId, viewOnly, password) {
   let unit = null;
   if (!viewOnly) {
     unit = (await db.query('SELECT * FROM units WHERE id=$1', [Number(unitId)]))[0];
     if (!unit) throw new HttpError(400, 'היחידה לא נמצאה');
+    if (unit.parent_id == null && !(await checkAdminPassword(password))) throw new HttpError(403, 'הסיסמה שגויה');
   }
   const token = crypto.randomBytes(32).toString('hex');
   const expires = new Date(Date.now() + SESSION_DAYS * 86400000);
@@ -68,7 +81,7 @@ export async function enterAsUnit(unitId, viewOnly) {
 
 const unitUser = (u) => ({
   id: u.id, unit_id: u.id, username: `unit-${u.id}`, display_name: u.name, head: u.head, kind: u.kind,
-  role: u.parent_id == null ? 'admin' : 'editor', active: true,
+  role: u.parent_id == null ? 'admin' : 'editor', active: true, edit_all: !!u.edit_all,
 });
 export const VIEWER = { id: null, unit_id: null, username: 'viewer', display_name: 'צפייה בלבד', head: '', kind: 'viewer', role: 'viewer', active: true };
 

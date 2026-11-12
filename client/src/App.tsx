@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api';
 import { Model } from './model';
 import type { AppData, User, Unit } from './types';
@@ -10,7 +10,11 @@ import { HistoryView } from './components/HistoryView';
 import { SettingsView } from './components/SettingsView';
 import { Icon } from './components/Icon';
 import { OrgLogos } from './components/OrgLogos';
-import { Tour, tourSeen, markTourSeen, PRESENT_STEPS } from './components/Tour';
+import { LandingBg } from './components/LandingBg';
+import { getThemePref, setThemePref, type ThemePref } from './theme';
+import logoUrl from './assets/logo.png';
+import logoDarkUrl from './assets/logo-dark.png';
+import { Tour, tourSeen, markTourSeen, PRESENT_STEPS, SETTINGS_STEPS, ORG_STEPS } from './components/Tour';
 
 // Every new visit starts at the landing page ("choose your team"). Within the same browser
 // tab the choice is kept, so refreshing the page does not send you back there.
@@ -33,15 +37,27 @@ export function App() {
 export function Logo({ small }: { small?: boolean }) {
   return (
     <span className={`logo ${small ? 'small' : ''}`}>
-      <svg viewBox="0 0 32 32" width={small ? 26 : 40} height={small ? 26 : 40} aria-hidden="true">
-        <rect width="32" height="32" rx="8" fill="#2f5bd3" />
-        <rect x="13" y="7" width="13" height="4" rx="2" fill="#fff" />
-        <rect x="8" y="14" width="12" height="4" rx="2" fill="#fff" opacity=".85" />
-        <rect x="5" y="21" width="9" height="4" rx="2" fill="#fff" opacity=".7" />
-      </svg>
-      <span className="logo-text">Gantraah</span>
+      <img className="logo-light" src={logoUrl} alt="Ganttraah" height={small ? 34 : 64} />
+      <img className="logo-dark" src={logoDarkUrl} alt="Ganttraah" height={small ? 34 : 64} />
     </span>
   );
+}
+
+/**
+ * Every entry (or switch of unit) starts from the same place: the owner filter shows the
+ * unit's own tasks and those of the units below it, the project bar shows its own projects.
+ */
+function resetFilters(units: Unit[], u: User) {
+  const below = (id: number): number[] => [id, ...units.filter((x) => x.parent_id === id).flatMap((x) => below(x.id))];
+  const owners = u.role === 'admin' || u.unit_id == null ? [] : below(u.unit_id);
+  try {
+    localStorage.setItem('gantraah.owners', JSON.stringify(owners));
+    localStorage.setItem('gantraah.filter', 'null');
+    localStorage.setItem('gantraah.allProjects', 'false');
+    localStorage.setItem('gantraah.favOnly', 'false');
+    for (const k of ['gantraah.meet.pick', 'gantraah.meet.ownerFilter', 'gantraah.meet.favOnly', 'gantraah.whatif']) localStorage.removeItem(k);
+  } catch { /* ignore */ }
+  if (location.hash && location.hash !== '#/gantt') history.replaceState(null, '', '#/gantt');
 }
 
 /** Landing page: "Hello, choose your team" + the organisation tree. */
@@ -50,12 +66,18 @@ function Landing({ onEnter }: { onEnter: (u: User) => void }) {
   const [err, setErr] = useState('');
   const last = (() => { try { return Number(localStorage.getItem('gantraah.lastUnit')) || null; } catch { return null; } })();
   useEffect(() => { api.get<Unit[]>('/units').then(setUnits).catch((e) => setErr(e.message)); }, []);
-  const enter = async (unitId: number | null) => {
+  const [pwFor, setPwFor] = useState<Unit | null>(null);
+  const [pw, setPw] = useState('');
+  const [pwErr, setPwErr] = useState('');
+  const enter = async (unitId: number | null, password?: string) => {
+    const u = units?.find((x) => x.id === unitId);
+    if (u && u.parent_id == null && password == null) { setPwFor(u); setPw(''); setPwErr(''); return; } // branch management: password first
     try {
-      const r = await api.post<{ user: User }>('/enter', unitId == null ? { view_only: true } : { unit_id: unitId });
+      const r = await api.post<{ user: User }>('/enter', unitId == null ? { view_only: true } : { unit_id: unitId, password });
       try { if (unitId != null) localStorage.setItem('gantraah.lastUnit', String(unitId)); } catch { /* ignore */ }
+      resetFilters(units || [], r.user);
       onEnter(r.user);
-    } catch (e) { setErr((e as Error).message); }
+    } catch (e) { if (password != null) setPwErr((e as Error).message); else setErr((e as Error).message); }
   };
   const kids = (pid: number | null) => (units || []).filter((u) => u.parent_id === pid).sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
   const root = kids(null)[0];
@@ -80,9 +102,9 @@ function Landing({ onEnter }: { onEnter: (u: User) => void }) {
   );
   return (
     <div className="landing">
+      <LandingBg />
       <header className="landing-top">
         <Logo />
-        <OrgLogos size={40} />
       </header>
       <h1>שלום, בחר/י את המסגרת שלך</h1>
       <p className="muted">כולם רואים את כל התוכנית. אפשר לערוך רק משימות שבאחריות היחידה שלך, או של היחידות שמתחתיה.</p>
@@ -95,6 +117,20 @@ function Landing({ onEnter }: { onEnter: (u: User) => void }) {
           : coveredCount ? <>בכניסה כ<b>{hu.name}</b> אפשר לערוך את המשימות שלו ושל {coveredCount} היחידות שמתחתיו (מסומנות).</>
           : <>בכניסה כ<b>{hu.name}</b> אפשר לערוך את המשימות של הצוות.</>) : 'העבר/י את העכבר על יחידה כדי לראות מה היא יכולה לערוך.'}
       </p>
+      {pwFor && (
+        <div className="modal-bg" onClick={() => setPwFor(null)}>
+          <form className="modal pw-modal" onClick={(e) => e.stopPropagation()} onSubmit={(e) => { e.preventDefault(); enter(pwFor.id, pw); }}>
+            <h2><Icon name="lock" size={18} /> כניסה כ{pwFor.name}</h2>
+            <p className="muted small">הנהלת הענף עורכת את כל התוכנית, ולכן הכניסה אליה מוגנת בסיסמה.</p>
+            <input type="password" autoFocus placeholder="סיסמה" value={pw} onChange={(e) => { setPw(e.target.value); setPwErr(''); }} />
+            {pwErr && <p className="bad small">{pwErr}</p>}
+            <div className="modal-actions">
+              <button className="btn primary" type="submit" disabled={!pw}>כניסה</button>
+              <button className="btn" type="button" onClick={() => setPwFor(null)}>ביטול</button>
+            </div>
+          </form>
+        </div>
+      )}
       {root && (
         <div className="org-tree">
           <div className="org-root">{card(root, true)}</div>
@@ -108,11 +144,79 @@ function Landing({ onEnter }: { onEnter: (u: User) => void }) {
           </div>
         </div>
       )}
+      <footer className="landing-foot">
+        <OrgLogos size={56} />
+        <p>נוצר ע״י לירון כהן</p>
+        <p className="muted">מתוחזק ע״י ?</p>
+      </footer>
     </div>
   );
 }
 
 interface Toast { id: number; msg: string; kind: 'info' | 'ok' | 'error' }
+
+/** the screens' tabs; a marker glides to the chosen one */
+function NavTabs({ items, page }: { items: { id: string; label: string; icon: string; href: string }[]; page: string }) {
+  const ref = useRef<HTMLElement>(null);
+  const [pill, setPill] = useState<{ left: number; width: number } | null>(null);
+  const first = useRef(true);
+  useLayoutEffect(() => {
+    const nav = ref.current;
+    if (!nav) return;
+    const measure = () => {
+      const a = nav.querySelector<HTMLElement>('a.on');
+      setPill(a ? { left: a.offsetLeft, width: a.offsetWidth } : null);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(nav);
+    return () => ro.disconnect();
+  }, [page]);
+  useEffect(() => { if (pill) first.current = false; }, [pill]);
+  return (
+    <nav data-tour="nav" ref={ref}>
+      {pill && <span className={`nav-pill ${first.current ? 'still' : ''}`} style={{ left: pill.left, width: pill.width }} />}
+      {items.map((n) => (
+        <a key={n.id} href={n.href} className={page === n.id ? 'on' : ''}><Icon name={n.icon} size={16} />{n.label}</a>
+      ))}
+    </nav>
+  );
+}
+
+/** light / dark / like the device: a sun or moon next to the unit's name, with a small menu */
+const LOOKS: { id: ThemePref; label: string; icon: string }[] = [
+  { id: 'light', label: 'בהירה', icon: 'sun' },
+  { id: 'dark', label: 'כהה', icon: 'moon' },
+  { id: 'system', label: 'לפי המכשיר', icon: 'auto' },
+];
+function ThemeButton() {
+  const [pref, setPref] = useState<ThemePref>(getThemePref);
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [open]);
+  const cur = LOOKS.find((l) => l.id === pref)!;
+  return (
+    <span className="dd" ref={ref}>
+      <button className="icon-btn theme-btn" onClick={() => setOpen(!open)} title={`תצוגה: ${cur.label}`} aria-label={`תצוגה: ${cur.label}`}>
+        <Icon name={cur.icon} size={17} />
+      </button>
+      {open && (
+        <div className="dd-menu theme-menu">
+          {LOOKS.map((l) => (
+            <button key={l.id} className={`dd-item ${pref === l.id ? 'on' : ''}`} onClick={() => { setPref(l.id); setThemePref(l.id); setOpen(false); }}>
+              <Icon name={l.icon} size={15} /><span><b>{l.label}</b></span>{pref === l.id && <Icon name="check" size={14} className="dd-check" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
 
 function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [data, setData] = useState<AppData | null>(null);
@@ -121,10 +225,11 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [openRequest, setOpenRequest] = useState<{ id: number; n: number } | null>(null);
   const [lastFocus, setLastFocus] = useState<number | null>(null);
   const [sim, setSim] = useState<SimOverlay | null>(null);
-  const [tour, setTour] = useState<false | 'main' | 'present'>(false);
+  const [tour, setTour] = useState<false | 'main' | 'present' | 'settings' | 'org'>(false);
   // the tour of the screen you are on: the manager view has its own short one
   const startTour = () => {
     if (location.hash.startsWith('#/present')) { setTour('present'); return; }
+    if (location.hash.startsWith('#/settings')) { setTour(document.querySelector('.org-tree.edit') ? 'org' : 'settings'); return; }
     if (location.hash && !location.hash.startsWith('#/gantt')) location.hash = '#/gantt';
     setTimeout(() => setTour('main'), 350);
   };
@@ -230,58 +335,57 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
 
   const ctx: Ctx = {
     model, user, canEdit, isAdmin: user.role === 'admin', reload, run, toast, go, sim, setSim, undoRedo,
+    toggleFavorite: (id) => {
+      const on = !model.favorites.has(id);
+      api.post('/favorites', { task_id: id, on }).then(reload, (e) => toast((e as Error).message, 'error'));
+      toast(on ? 'נוסף למועדפים' : 'הוסר מהמועדפים', 'ok');
+    },
     canEditTask: (id) => {
-      if (user.role === 'admin') return true;
+      if (user.role === 'admin' || (user.role === 'editor' && user.edit_all)) return true;
       if (user.role !== 'editor' || user.unit_id == null) return false;
       const o = model.effOwner(id).unit;
       return o != null && model.unitWithin(o, user.unit_id);
     },
-    assignable: user.role === 'admin' ? model.unitTree().map((x) => x.unit) : user.unit_id != null ? model.unitTree(user.unit_id).map((x) => x.unit) : [],
+    assignable: user.role === 'admin' || user.edit_all ? model.unitTree().map((x) => x.unit) : user.unit_id != null ? model.unitTree(user.unit_id).map((x) => x.unit) : [],
     openTask: (id) => { setOpenRequest({ id, n: Date.now() }); go('#/gantt'); },
     focusTask: (id) => { setLastFocus(id); go(`#/focus/${id}`); },
   };
 
   const nav = [
     { id: 'gantt', label: 'תכנית עבודה', icon: 'gantt', href: '#/gantt' },
-    { id: 'focus', label: 'מפת השפעות', icon: 'focus', href: focusId ? `#/focus/${focusId}` : '#/focus' },
+    { id: 'focus', label: 'מפת תלויות', icon: 'deps', href: focusId ? `#/focus/${focusId}` : '#/focus' },
     { id: 'present', label: 'תצוגת מנהלים', icon: 'present', href: '#/present' },
     { id: 'history', label: 'היסטוריה', icon: 'history', href: '#/history' },
     { id: 'settings', label: 'הגדרות', icon: 'settings', href: '#/settings' },
   ];
-  const roleLabel = user.role === 'admin' ? 'עריכת כל התוכנית' : user.role === 'viewer' ? 'ללא עריכה' : 'עריכת משימות היחידה';
+  const hasTour = page === 'gantt' || page === 'present' || page === 'settings';
 
   return (
     <AppCtx.Provider value={ctx}>
       <div className="shell">
         <header className="topbar">
           <a href="#/gantt" className="brand"><Logo small /></a>
-          <nav data-tour="nav">
-            {nav.map((n) => (
-              <a key={n.id} href={n.href} className={page === n.id ? 'on' : ''}><Icon name={n.icon} size={16} />{n.label}</a>
-            ))}
-          </nav>
+          <NavTabs items={nav} page={page} />
           <span style={{ flex: 1 }} />
           {import.meta.env.VITE_DEMO === '1' && (
-            <span className="demo-chip" title="גרסת הדגמה: השינויים נשמרים רק בדפדפן הזה">
-              הדגמה
-              <button className="link" onClick={async () => {
-                if (!confirm('להחזיר את נתוני ההדגמה למצב ההתחלתי? כל השינויים שנעשו כאן יימחקו.')) return;
-                (await import('./demo/backend')).resetDemo();
-                location.reload();
-              }}>איפוס</button>
-            </span>
+            <button className="icon-btn" title="החזרת נתוני הדוגמה למצב ההתחלתי" onClick={async () => {
+              if (!confirm('להחזיר את נתוני הדוגמה למצב ההתחלתי? כל השינויים שנעשו כאן יימחקו.')) return;
+              (await import('./demo/backend')).resetDemo();
+              location.reload();
+            }}><Icon name="refresh" size={16} /></button>
           )}
           {!online && <span className="offline">אין חיבור לשרת, מנסה להתחבר מחדש…</span>}
           {data!.cycle && <span className="chip bad">נמצאה תלות מעגלית</span>}
-          <span className="me"><Icon name="user" size={15} />{user.display_name}<span className="muted"> · {roleLabel}</span></span>
-          <button className="btn small" data-tour="help" title="סיור קצר במערכת" onClick={startTour}>? סיור</button>
-          <button className="btn small" title="חזרה לבחירת המסגרת" onClick={onLogout}><Icon name="logout" size={14} /> החלפת מסגרת</button>
+          <span className="me"><Icon name="user" size={15} />{user.display_name}</span>
+          <ThemeButton />
+          {hasTour && <button className="btn small" data-tour="help" title="סיור קצר במסך הזה" onClick={startTour}>סיור</button>}
+          <button className="btn small" title="יציאה וחזרה לבחירת המסגרת" onClick={onLogout}><Icon name="logout" size={14} /> יציאה</button>
           <span className="topbar-sep" />
           <OrgLogos size={32} />
         </header>
         <main>
           {page === 'gantt' && <GanttPage openRequest={openRequest} />}
-          {tour && <Tour steps={tour === 'present' ? PRESENT_STEPS : undefined} onClose={() => { if (tour === 'main') markTourSeen(); setTour(false); }} />}
+          {tour && <Tour steps={tour === 'present' ? PRESENT_STEPS : tour === 'settings' ? SETTINGS_STEPS : tour === 'org' ? ORG_STEPS : undefined} onClose={() => { if (tour === 'main') markTourSeen(); setTour(false); }} />}
           {page === 'focus' && <FocusView taskId={focusId && model.task(focusId) ? focusId : null} />}
           {page === 'present' && <PresentView />}
           {page === 'history' && <HistoryView />}

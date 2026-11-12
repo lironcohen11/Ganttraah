@@ -22,7 +22,7 @@ const EDIT_COLS: Column[] = [
   { id: 'finish', title: 'סיום', width: 78 },
   { id: 'pct', title: 'התקדמות', width: 74 },
   { id: 'owner', title: 'אחראי', width: 112 },
-  { id: 'status', title: 'מצב', width: 44 },
+  { id: 'status', title: 'מצב', width: 78 },
 ];
 const PRESENT_COLS: Column[] = [
   { id: 'wbs', title: '#', width: 48 },
@@ -30,7 +30,7 @@ const PRESENT_COLS: Column[] = [
   { id: 'start', title: 'התחלה', width: 86 },
   { id: 'finish', title: 'סיום', width: 86 },
   { id: 'pct', title: 'התקדמות', width: 84 },
-  { id: 'status', title: 'מצב', width: 44 },
+  { id: 'status', title: 'מצב', width: 78 },
 ];
 
 export interface Highlight { up: Set<number>; down: Set<number>; upDeps: Set<number>; downDeps: Set<number> }
@@ -61,22 +61,60 @@ interface Props {
   blocked?: Set<number> | null;
   scrollToken?: number;
   revealId?: number | null;
+  /** width of the task-name column; the divider between the table and the chart changes it */
+  nameW?: number;
+  onNameW?: (w: number) => void;
 }
 
 const HEAD_H = 52;
 const C = {
-  up: '#d97706', down: '#7c3aed', crit: '#dc2626', arrow: '#8a94a6', summary: '#2b3445', ms: '#1c2330',
-  deadline: '#16a34a', late: '#dc2626', today: '#e11d48', baseline: '#a3abb8',
+  // theme variables (light / dark are set in styles.css)
+  up: 'var(--up)', down: 'var(--down)', crit: 'var(--bad)', arrow: 'var(--g-arrow)', summary: 'var(--g-summary)', ms: 'var(--g-ms)',
+  deadline: 'var(--g-deadline)', late: 'var(--bad)', today: 'var(--g-today)', baseline: 'var(--g-baseline)',
 };
 
 export function Gantt(p: Props) {
   const { model, rows, zoom } = p;
-  const px = ZOOMS.find((z) => z.id === zoom)!.px;
+  // Changing the zoom does not jump: the scale glides from the old width of a day to the new
+  // one in a quarter of a second, and the date in the middle of the view stays in the middle.
+  const targetPx = ZOOMS.find((z) => z.id === zoom)!.px;
+  const [px, setPx] = useState(targetPx);
+  const pxRef = useRef(px);
+  pxRef.current = px;
+  useEffect(() => {
+    const from = pxRef.current, to = targetPx;
+    if (Math.abs(from - to) < 0.001) return;
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) { setPx(to); return; }
+    const dur = 240, t0 = performance.now();
+    let raf = 0;
+    const step = (now: number) => {
+      const k = Math.min(1, (now - t0) / dur);
+      const e = 1 - Math.pow(1 - k, 3);
+      setPx(k >= 1 ? to : from * Math.pow(to / from, e)); // even steps on a zoom scale
+      if (k < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    const safety = window.setTimeout(() => setPx(to), dur + 200); // animation frames paused (hidden window)
+    return () => { cancelAnimationFrame(raf); clearTimeout(safety); };
+  }, [targetPx]);
   const present = p.mode === 'present';
   const rowH = present ? 40 : 34;
-  const cols = present ? PRESENT_COLS : EDIT_COLS;
+  const cols = present ? PRESENT_COLS : EDIT_COLS.map((c) => (c.id === 'name' && p.nameW ? { ...c, width: p.nameW } : c));
   const tableW = cols.reduce((s, c) => s + c.width, 0);
   const todayDay = toDay(model.data.today);
+
+  // size of the visible area: the chart always fills it (no white block on a big screen)
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [viewW, setViewW] = useState(0);
+  const [viewH, setViewH] = useState(0);
+  const [sbW, setSbW] = useState(0);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => { setViewW(el.clientWidth); setViewH(el.clientHeight); setSbW(el.offsetWidth - el.clientWidth); });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const [r0, r1] = useMemo(() => {
     let lo = todayDay, hi = todayDay;
@@ -87,11 +125,16 @@ export function Gantt(p: Props) {
     }
     if (p.ghosts) for (const g of p.ghosts.values()) { add(g.start); add(g.finish); }
     const pad = { day: [7, 21], week: [21, 56], month: [45, 120], quarter: [90, 240] }[zoom];
-    return [lo - pad[0], hi + pad[1]];
-  }, [rows, zoom, todayDay, p.showBaseline, p.ghosts]);
+    let a = lo - pad[0], b = hi + pad[1];
+    // a short plan at a wide zoom: stretch the time range so it fills the whole width
+    const minDays = Math.ceil(Math.max(0, viewW - tableW) / px) + 2;
+    if (b - a + 1 < minDays) { const extra = minDays - (b - a + 1); a -= Math.floor(extra / 3); b += extra - Math.floor(extra / 3); }
+    return [a, b];
+  }, [rows, zoom, todayDay, p.showBaseline, p.ghosts, viewW, tableW, px]);
 
   const W = Math.ceil((r1 - r0 + 1) * px);
   const H = Math.max(rows.length * rowH, 1);
+  const HC = H;
   const xR = (day: number) => (r1 - day + 1) * px; // right edge of a day = its start (RTL)
   const xL = (day: number) => (r1 - day) * px;     // left edge of a day  = its end
 
@@ -102,7 +145,6 @@ export function Gantt(p: Props) {
   }, [rows]);
 
   // ---------- scrolling
-  const scrollRef = useRef<HTMLDivElement>(null);
   const scrollToDay = (day: number) => {
     const el = scrollRef.current;
     if (!el) return;
@@ -132,23 +174,57 @@ export function Gantt(p: Props) {
   // When the plan changes (drag, edit) the date range of the chart can grow or shrink.
   // Before re-positioning, work out which date was in the middle of the view using the
   // PREVIOUS geometry, then put that same date back in the middle - the view stays still.
-  const geom = useRef<{ r1: number; W: number; px: number } | null>(null);
+  const geom = useRef<{ r1: number; W: number; px: number; tableW: number } | null>(null);
+  const lastScroll = useRef(0);
   const lastToken = useRef(p.scrollToken);
-  const lastZoom = useRef<Zoom | null>(null);
+  const first = useRef(true);
+  const scaleRef = useRef<SVGSVGElement>(null);
   useLayoutEffect(() => {
     const el = scrollRef.current;
     const prev = geom.current;
-    if (lastZoom.current !== zoom) { lastZoom.current = zoom; jumpToDay(todayDay); }   // first show / zoom change
+    // the date that was in the middle of the view, using the PREVIOUS geometry
+    // (the scroll position as it was BEFORE this render: the browser may already have clipped el.scrollLeft
+    // to the new, narrower chart)
+    const centerBefore = () => {
+      const x = lastScroll.current + prev!.W - (el!.clientWidth - prev!.tableW) / 2; // xR(day) before
+      return prev!.r1 + 1 - x / prev!.px;
+    };
+    if (first.current || !el || !prev || !prev.W) { if (viewW) { jumpToDay(todayDay); first.current = false; } } // first show
     else if (p.scrollToken !== lastToken.current) glideToDay(todayDay);                // "today" button
-    else if (el && prev) {                                                             // plan changed: stay put
-      const x = el.scrollLeft + (tableW + prev.W) - tableW - (el.clientWidth - tableW) / 2; // xR(day) before
-      const day = prev.r1 + 1 - x / prev.px;
-      el.scrollLeft = scrollToDay(day)!;
-    }
+    else el.scrollLeft = scrollToDay(centerBefore())!;                                 // zoom glide, plan changed: stay put
     lastToken.current = p.scrollToken;
-    geom.current = { r1, W, px };
+    geom.current = { r1, W, px, tableW };
+    if (el) lastScroll.current = el.scrollLeft;
     /* eslint-disable-next-line */
-  }, [zoom, p.scrollToken, r0, r1]);
+  }, [px, p.scrollToken, r0, r1, tableW, viewW]);
+
+  // ---------- horizontal scrollbar under the chart only (the native one would span the table too)
+  const hsRef = useRef<HTMLDivElement>(null);
+  const syncing = useRef(false);
+  const onMainScroll = () => {
+    const el = scrollRef.current, hs = hsRef.current;
+    if (el && geom.current && geom.current.W === W) lastScroll.current = el.scrollLeft;
+    if (!el || !hs || syncing.current) { syncing.current = false; return; }
+    if (Math.abs(hs.scrollLeft - el.scrollLeft) > 0.5) { syncing.current = true; hs.scrollLeft = el.scrollLeft; }
+  };
+  const onBarScroll = () => {
+    const el = scrollRef.current, hs = hsRef.current;
+    if (!el || !hs || syncing.current) { syncing.current = false; return; }
+    if (Math.abs(hs.scrollLeft - el.scrollLeft) > 0.5) { syncing.current = true; el.scrollLeft = hs.scrollLeft; }
+  };
+  useLayoutEffect(() => { const el = scrollRef.current, hs = hsRef.current; if (el && hs) hs.scrollLeft = el.scrollLeft; });
+
+  // ---------- divider between the table and the chart
+  const startSplit = (e: React.PointerEvent) => {
+    if (!p.onNameW) return;
+    e.preventDefault();
+    const x0 = e.clientX, w0 = p.nameW || 280;
+    document.body.classList.add('no-select', 'col-resizing');
+    const mv = (ev: PointerEvent) => p.onNameW!(Math.max(140, Math.min(700, w0 + (x0 - ev.clientX)))); // RTL: dragging left widens the table
+    const up = () => { window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); document.body.classList.remove('no-select', 'col-resizing'); };
+    window.addEventListener('pointermove', mv);
+    window.addEventListener('pointerup', up);
+  };
   useEffect(() => {
     if (p.revealId == null) return;
     const t = model.task(p.revealId);
@@ -284,6 +360,22 @@ export function Gantt(p: Props) {
     return out;
   }, [r0, r1, zoom, model]);
 
+  // special days of a unit: marked only on the rows of that unit's tasks
+  const unitOff = useMemo(() => {
+    if (zoom === 'month' || zoom === 'quarter' || !(model.data.unitDays || []).length) return [];
+    const out: { i: number; d: number; label: string }[] = [];
+    rows.forEach((r, i) => {
+      if (r.type !== 'task') return;
+      for (const u of model.unitDaysOf(r.task.id)) {
+        const unit = model.units.get(u.unit_id)?.name || '';
+        for (let d = Math.max(r0, toDay(u.start_day)); d <= Math.min(r1, toDay(u.end_day)); d++) {
+          if (model.cal.isWork(d)) out.push({ i, d, label: `${u.label || 'יום מיוחד'} · ${unit}: לא עובדים ביום הזה` });
+        }
+      }
+    });
+    return out;
+  }, [rows, r0, r1, zoom, model]);
+
   // ---------- geometry of a task bar
   const barGeom = (t: Task, i: number) => {
     const y = i * rowH;
@@ -335,14 +427,15 @@ export function Gantt(p: Props) {
   const hoverTask = hover ? model.task(hover.id) : null;
 
   return (
-    <div className={`gantt ${present ? 'present' : ''}`} ref={scrollRef} onClick={() => p.onSelectRow(null)}>
+   <div className="gantt-wrap">
+    <div className={`gantt ${present ? 'present' : ''}`} ref={scrollRef} onClick={() => p.onSelectRow(null)} onScroll={onMainScroll}>
       <div className="g-inner" style={{ width: tableW + W }}>
         {/* ---------------- header */}
         <div className="g-head" style={{ height: HEAD_H }}>
           <div className="g-table-head" style={{ width: tableW }}>
             {cols.map((c) => <div key={c.id} className={`cell c-${c.id}`} style={{ width: c.width }}>{c.title}</div>)}
           </div>
-          <svg width={W} height={HEAD_H} className="g-scale">
+          <svg width={W} height={HEAD_H} className="g-scale" ref={scaleRef}>
             {header.top.map((s, i) => (
               <g key={'t' + i}>
                 <line x1={s.x1} x2={s.x1} y1={0} y2={HEAD_H / 2} className="tick" />
@@ -367,8 +460,8 @@ export function Gantt(p: Props) {
         </div>
 
         {/* ---------------- body */}
-        <div className="g-body" style={{ height: H }}>
-          <div className="g-table" style={{ width: tableW }}>
+        <div className="g-body" style={{ height: HC }}>
+          <div className="g-table" style={{ width: tableW, height: HC }}>
             {rows.map((r, i) => (
               <GridRow key={r.key + i} row={r} cols={cols} rowH={rowH} model={model} present={present}
                 selected={p.selectedKey === r.key}
@@ -389,21 +482,24 @@ export function Gantt(p: Props) {
             ))}
           </div>
 
-          <svg ref={svgRef} width={W} height={H} className="g-chart"
+          <svg ref={svgRef} width={W} height={HC} className="g-chart"
             onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={() => setDrag(null)}
             onClick={(e) => e.stopPropagation()}
             onPointerDown={(e) => { if (e.target === svgRef.current) p.onSelectRow(null); }}>
             <defs>
               {(['arrow', 'up', 'down', 'crit', 'faded'] as const).map((k) => (
                 <marker key={k} id={`ah-${k}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                  <path d="M0,0 L10,5 L0,10 z" fill={k === 'arrow' ? C.arrow : k === 'faded' ? '#d5d9e0' : k === 'crit' ? C.crit : C[k]} />
+                  <path d="M0,0 L10,5 L0,10 z" fill={k === 'arrow' ? C.arrow : k === 'faded' ? 'var(--g-faded)' : k === 'crit' ? C.crit : C[k]} />
                 </marker>
               ))}
               <marker id="ah-link" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                <path d="M0,0 L10,5 L0,10 z" fill="#16a34a" />
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--g-deadline)" />
               </marker>
+              <pattern id="hatch-unit" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+                <line x1="0" y1="0" x2="0" y2="7" stroke="#e6a23c" strokeWidth="2.2" strokeOpacity=".55" />
+              </pattern>
               <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-                <rect width="6" height="6" fill="#fde8e8" /><line x1="0" y1="0" x2="0" y2="6" stroke="#dc2626" strokeWidth="2" />
+                <rect width="6" height="6" fill="var(--bad-soft)" /><line x1="0" y1="0" x2="0" y2="6" stroke="var(--bad)" strokeWidth="2" />
               </pattern>
             </defs>
 
@@ -413,12 +509,15 @@ export function Gantt(p: Props) {
                 className={`row-bg ${p.selectedKey === r.key ? 'sel' : ''} ${r.type === 'project' ? 'proj' : ''} ${r.type === 'group' ? 'grp' : ''}`} />
             ))}
             {offDays.map((o) => (
-              <rect key={'off' + o.d} x={xL(o.d)} y={0} width={px} height={H} className={o.hol ? 'hol-col' : 'off-col'}>
+              <rect key={'off' + o.d} x={xL(o.d)} y={0} width={px} height={HC} className={o.hol ? 'hol-col' : 'off-col'}>
                 {o.hol && <title>{o.hol}</title>}
               </rect>
             ))}
-            {header.top.map((s, i) => <line key={'ml' + i} x1={s.x1} x2={s.x1} y1={0} y2={H} className="month-line" />)}
-            <line x1={xR(todayDay) - px / 2} x2={xR(todayDay) - px / 2} y1={0} y2={H} className="today-line" />
+            {unitOff.map((o) => (
+              <rect key={`uo${o.i}-${o.d}`} x={xL(o.d)} y={o.i * rowH} width={px} height={rowH} className="unit-off"><title>{o.label}</title></rect>
+            ))}
+            {header.top.map((s, i) => <line key={'ml' + i} x1={s.x1} x2={s.x1} y1={0} y2={HC} className="month-line" />)}
+            <line x1={xR(todayDay) - px / 2} x2={xR(todayDay) - px / 2} y1={0} y2={HC} className="today-line" />
 
             {/* dependency arrows */}
             <g className="arrows">
@@ -490,7 +589,7 @@ export function Gantt(p: Props) {
                   ) : t.kind === 'milestone' ? (
                     <g onPointerDown={(e) => startDrag(e, 'move', r)}>
                       {(hl || sel) && <circle cx={left} cy={g.cy} r={13} className={`hl-box ${sel ? 'sel' : hl}`} />}
-                      <path d={diamond(left, g.cy, present ? 9 : 8)} fill={isBlocked ? 'url(#hatch)' : p.showCritical && t.critical ? C.crit : t.percent >= 100 ? C.ms : '#fff'}
+                      <path d={diamond(left, g.cy, present ? 9 : 8)} fill={isBlocked ? 'url(#hatch)' : p.showCritical && t.critical ? C.crit : t.percent >= 100 ? C.ms : 'var(--surface)'}
                         stroke={p.showCritical && t.critical ? C.crit : C.ms} strokeWidth={2} />
                     </g>
                   ) : (
@@ -563,6 +662,11 @@ export function Gantt(p: Props) {
       {hoverTask && !drag && <Tooltip t={hoverTask} model={model} x={hover!.cx} y={hover!.cy} showOwner={!present || p.showOwners} />}
       {!rows.length && <div className="g-empty">אין משימות להצגה</div>}
     </div>
+    {p.onNameW && <div className="g-split" style={{ right: tableW - 4 }} onPointerDown={startSplit} title="גרירה משנה את רוחב הטבלה" />}
+    <div className="g-hscroll" ref={hsRef} onScroll={onBarScroll} style={{ width: Math.max(0, viewW - tableW), marginInlineEnd: sbW }}>
+      <div style={{ width: W, height: 1 }} />
+    </div>
+   </div>
   );
 }
 
@@ -664,9 +768,23 @@ function GridRow(g: GridRowProps) {
         return u ? <span className={o.inherited ? 'inherited' : ''} title={`${u.name}${o.inherited ? ' (עובר מאב-המשימה)' : ''}`}>{u.name}</span> : '';
       }
       case 'status': {
-        if (!t) return pr.late_count || pr.deadline_issues ? <span className="st late" title="יש משימות באיחור או בחריגה" /> : pr.behind_count ? <span className="st behind" title="יש משימות בפיגור" /> : null;
+        // a coloured status tag that fills the cell, with the status in words
+        if (!t) {
+          const late = pr.late_count + pr.deadline_issues, behind = pr.behind_count;
+          if (pr.percent >= 100) return <span className="st-tag done">הושלם</span>;
+          if (late) return <span className="st-tag late" title={`${late} משימות באיחור או בחריגה מתאריך יעד`}>באיחור</span>;
+          if (behind) return <span className="st-tag behind" title={`${behind} משימות בפיגור`}>בפיגור</span>;
+          return <span className="st-tag active">תקין</span>;
+        }
         const bad = t.deadline_missed || (t.kind === 'summary' && t.has_deadline_issue);
-        return <span className={`st ${t.status} ${bad ? 'ring' : ''}`} title={`${STATUS_LABEL[t.status]}${bad ? ' · חריגה מתאריך יעד' : ''}`} />;
+        const label = t.kind === 'milestone'
+          ? ({ done: 'הושגה', late: 'לא הושגה', planned: 'מתוכננת', active: 'מתוכננת', behind: 'מתוכננת' } as const)[t.status]
+          : STATUS_LABEL[t.status];
+        return (
+          <span className={`st-tag ${t.status} ${bad ? 'over' : ''}`} title={`${label}${bad ? ' · חורגת מתאריך היעד' : ''}`}>
+            {label}{bad && <Icon name="alert" size={11} className="st-alert" />}
+          </span>
+        );
       }
     }
     return null;
@@ -679,16 +797,26 @@ function GridRow(g: GridRowProps) {
 }
 
 export function Legend({ showBaseline, showCritical }: { showBaseline: boolean; showCritical: boolean }) {
+  const row = (icon: React.ReactNode, text: string) => <div className="lg-row"><span className="lg-ic">{icon}</span>{text}</div>;
   return (
     <div className="legend">
-      <span><svg width="26" height="12"><rect x="1" y="1" width="24" height="10" rx="3" fill="#3b6fd8" fillOpacity=".22" stroke="#3b6fd8" /><rect x="13" y="1" width="12" height="10" rx="3" fill="#3b6fd8" /></svg>משימה (החלק המלא = הושלם)</span>
-      <span><svg width="26" height="14"><path d="M1,2H25V13H22V8H4V13H1Z" fill={C.summary} /></svg>אב-משימה</span>
-      <span><svg width="16" height="16"><path d={diamond(8, 8, 6)} fill="#fff" stroke={C.ms} strokeWidth="2" /></svg>אבן דרך</span>
-      <span><svg width="12" height="10"><path d="M1,1h10l-5,7z" fill={C.deadline} /></svg>תאריך יעד</span>
-      <span><svg width="12" height="10"><path d="M1,1h10l-5,7z" fill={C.late} /></svg>חריגה מתאריך יעד</span>
-      {showBaseline && <span><svg width="26" height="8"><rect x="1" y="2" width="24" height="4" rx="2" fill={C.baseline} /></svg>התכנון המקורי (תכנון מול ביצוע)</span>}
-      {showCritical && <span><svg width="26" height="12"><rect x="1" y="1" width="24" height="10" rx="3" fill={C.crit} /></svg>נתיב קריטי</span>}
-      <span><svg width="4" height="14"><rect width="2" height="14" fill={C.today} /></svg>היום</span>
+      <div className="lg-title">פסים</div>
+      {row(<svg width="30" height="12"><rect x="1" y="1" width="28" height="10" rx="3" fill="#3b6fd8" fillOpacity=".22" stroke="#3b6fd8" /><rect x="15" y="1" width="14" height="10" rx="3" fill="#3b6fd8" /></svg>, 'משימה: החלק המלא = מה שהושלם')}
+      {row(<svg width="30" height="14"><path d="M1,2H29V9H26V13H23V9H7V13H4V9H1Z" fill={C.summary} /></svg>, 'אב-משימה: מתפרסת על כל מה שבתוכה')}
+      {row(<svg width="30" height="14"><g opacity=".3"><path d="M1,2H29V13H26V8H4V13H1Z" fill="#3b6fd8" /></g><rect x="15" y="2" width="14" height="6" fill="#3b6fd8" /></svg>, 'פרויקט: בהיר = כל הפרויקט, מלא = מה שהושלם')}
+      {row(<svg width="16" height="16"><path d={diamond(8, 8, 6)} fill="var(--surface)" stroke={C.ms} strokeWidth="2" /></svg>, 'אבן דרך (מלאה = הושגה)')}
+      {showBaseline && row(<svg width="30" height="8"><rect x="1" y="2" width="28" height="4" rx="2" fill={C.baseline} /></svg>, 'התכנון המקורי (תכנון מול ביצוע)')}
+      {showCritical && row(<svg width="30" height="12"><rect x="1" y="1" width="28" height="10" rx="3" fill={C.crit} /></svg>, 'נתיב קריטי: עיכוב בה מזיז את סיום הפרויקט')}
+      <div className="lg-title">סימונים</div>
+      {row(<svg width="12" height="10"><path d="M1,1h10l-5,7z" fill={C.deadline} /></svg>, 'תאריך יעד')}
+      {row(<svg width="12" height="10"><path d="M1,1h10l-5,7z" fill={C.late} /></svg>, 'חריגה מתאריך היעד')}
+      {row(<svg width="30" height="12"><path d="M1,6H12V10H26" fill="none" stroke={C.arrow} strokeWidth="1.3" /><path d="M24,7L29,10L24,13z" fill={C.arrow} /></svg>, 'תלות: המשימה שמשמאל מחכה לזו שמימין')}
+      {row(<svg width="30" height="12"><rect x="2" y="1" width="12" height="10" rx="3" fill="none" stroke={C.up} strokeWidth="2" /><rect x="17" y="1" width="12" height="10" rx="3" fill="none" stroke={C.down} strokeWidth="2" /></svg>, 'בהצגת התלויות: כתום משפיעה, סגול מושפעת')}
+      {row(<svg width="4" height="14"><rect width="2" height="14" fill={C.today} /></svg>, 'היום')}
+      <div className="lg-title">רקע</div>
+      {row(<svg width="16" height="14"><rect width="16" height="14" fill="var(--g-off)" stroke="var(--border)" /></svg>, 'סוף שבוע')}
+      {row(<svg width="16" height="14"><rect width="16" height="14" fill="var(--g-hol)" stroke="var(--g-hol-line)" /></svg>, 'חג או יום חופש של כל הענף')}
+      {row(<svg width="16" height="14"><defs><pattern id="lg-h" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" stroke="#e6a23c" strokeWidth="2" strokeOpacity=".6" /></pattern></defs><rect width="16" height="14" fill="url(#lg-h)" stroke="var(--g-hol-line)" /></svg>, 'יום מיוחד של מסגרת אחת: רק המשימות שלה לא עובדות בו')}
     </div>
   );
 }

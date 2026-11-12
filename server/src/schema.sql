@@ -1,4 +1,4 @@
--- Gantraah database schema. Safe to run on every start (idempotent).
+-- Ganttraah database schema. Safe to run on every start (idempotent).
 
 CREATE TABLE IF NOT EXISTS users (
   id            SERIAL PRIMARY KEY,
@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS audit_task_idx ON audit_log(task_id);
 CREATE INDEX IF NOT EXISTS audit_project_idx ON audit_log(project_id);
+CREATE INDEX IF NOT EXISTS audit_at_idx ON audit_log(at);   -- the yearly cleanup
 
 -- Undo / redo: full snapshot of the plan before each change (the plan is small).
 CREATE TABLE IF NOT EXISTS undo_stack (
@@ -113,3 +114,24 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner_unit_id INT REFERENCES units(id
 ALTER TABLE sessions ALTER COLUMN user_id DROP NOT NULL;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS unit_id INT REFERENCES units(id) ON DELETE CASCADE;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS view_only BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- 1.5.0: special days with date ranges, global (unit_id NULL) or for one unit and the units below it.
+CREATE TABLE IF NOT EXISTS special_days (
+  id        SERIAL PRIMARY KEY,
+  unit_id   INT REFERENCES units(id) ON DELETE CASCADE,
+  start_day DATE NOT NULL,
+  end_day   DATE NOT NULL,
+  kind      TEXT NOT NULL DEFAULT 'off',   -- off | work (work: global only)
+  label     TEXT NOT NULL DEFAULT ''
+);
+-- favourites are kept per unit (everyone who enters as the unit shares them)
+CREATE TABLE IF NOT EXISTS favorites (
+  unit_id INT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+  task_id INT NOT NULL,
+  PRIMARY KEY (unit_id, task_id)
+);
+-- a unit marked edit_all may edit every task in the plan (not settings or projects)
+ALTER TABLE units ADD COLUMN IF NOT EXISTS edit_all BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- 1.5.1: when the original plan (baseline) of a project was last saved
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS baseline_at TIMESTAMPTZ;

@@ -1,4 +1,4 @@
-# Gantraah on the internal server: application + PostgreSQL.
+# Ganttraah on the internal server: application + PostgreSQL.
 # Usage (in this folder):  docker compose --env-file compose.env up -d
 services:
   db:

@@ -1,4 +1,4 @@
-/** true in the single-file demo build (Gantraah-demo.html): no server, everything runs in the browser */
+/** true in the single-file demo build (Ganttraah-demo.html): no server, everything runs in the browser */
 export const IS_DEMO = import.meta.env.VITE_DEMO === '1';
 
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {

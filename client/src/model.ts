@@ -18,6 +18,7 @@ export class Model {
   projectList: Project[];
   units = new Map<number, Unit>();
   unitKids = new Map<number | null, Unit[]>();
+  favorites: Set<number>;
 
   constructor(public data: AppData) {
     for (const u of data.units || []) {
@@ -36,6 +37,23 @@ export class Model {
       this.depsOut.get(d.predecessor_id)!.push(d);
     }
     this.cal = new WorkCalendar(data.calendar.workDays, data.calendar.days);
+    this.favorites = new Set(data.favorites || []);
+  }
+
+  /** special days off that apply to this task (its owner unit's, or of a unit above the owner) */
+  unitDaysOf(id: number) {
+    const own = this.effOwner(id).unit;
+    if (own == null) return [];
+    return (this.data.unitDays || []).filter((r) => this.unitWithin(own, r.unit_id));
+  }
+  /** the unit and every unit below it */
+  unitSubtree(id: number): number[] {
+    return this.unitTree(id).map((x) => x.unit.id);
+  }
+  /** units whose tasks a project contains (directly or by inheritance) */
+  projectHasUnit(projectId: number, unitIds: number[]) {
+    if (!unitIds.length) return true;
+    return this.data.tasks.some((t) => t.project_id === projectId && (() => { const o = this.effOwner(t.id).unit; return o != null && unitIds.some((u) => this.unitWithin(o, u)); })());
   }
 
   // ---- organisation units
@@ -151,6 +169,7 @@ export interface RowOptions {
   includeExternal?: boolean;     // tasks outside the scope that are linked to it
   showProjects?: boolean;
   owners?: number[] | null;      // show only tasks of these units (and units below them)
+  only?: Set<number> | null;     // show only these tasks (e.g. favourites), with their parents as context
 }
 
 export function buildRows(m: Model, o: RowOptions): Row[] {
@@ -159,11 +178,13 @@ export function buildRows(m: Model, o: RowOptions): Row[] {
   // owner filter: a task is shown if it matches, or if something inside it matches (as context)
   let visible: Set<number> | null = null;
   const matches = new Set<number>();
-  if (o.owners?.length) {
+  if (o.owners?.length || o.only) {
     visible = new Set();
     for (const t of m.data.tasks) {
       const own = m.effOwner(t.id).unit;
-      if (own != null && o.owners.some((u) => m.unitWithin(own, u))) {
+      const okOwner = !o.owners?.length || (own != null && o.owners.some((u) => m.unitWithin(own, u)));
+      const okOnly = !o.only || o.only.has(t.id) || m.ancestors(t.id).some((a) => o.only!.has(a));
+      if (okOwner && okOnly) {
         matches.add(t.id);
         visible.add(t.id);
         for (const a of m.ancestors(t.id)) visible.add(a);

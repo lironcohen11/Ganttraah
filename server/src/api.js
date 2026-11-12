@@ -1,11 +1,11 @@
 import express from 'express';
 import { db, isoDate } from './db.js';
-import { HttpError, mutate, loadAll, currentSchedule, audit, broadcast, undoState, undoRedo } from './store.js';
+import { HttpError, mutate, loadAll, currentSchedule, audit, broadcast, undoState, undoRedo, HISTORY_DAYS } from './store.js';
 import { computeSchedule, DEP_TYPES } from './scheduler.js';
 import { toDay, fromDay, holidaysInRange, DEFAULT_CALENDAR } from './calendar.js';
 import { impactGraph, simulate, taskPath } from './impact.js';
-import { authenticate, requireRole, login, logout, sessionCookie, clearCookie, hashPassword, publicUser, enterAsUnit, userFromCookieHeader } from './auth.js';
-import { loadUnits, isWithin, effectiveOwner, canEditTask } from './units.js';
+import { authenticate, requireRole, login, logout, sessionCookie, clearCookie, hashPassword, publicUser, enterAsUnit, userFromCookieHeader, checkAdminPassword, setAdminPassword } from './auth.js';
+import { loadUnits, isWithin, effectiveOwner, canEditTask, kindAtDepth, unitDepth, unitSubtree } from './units.js';
 
 export const api = express.Router();
 api.use(express.json({ limit: '1mb' }));
@@ -54,20 +54,101 @@ api.get('/me', (req, res) => res.json({ user: req.user ? publicUser(req.user) : 
 // ------------------------------------------------------------------ organisation & entering as a unit
 api.get('/units', async (_req, res) => res.json(await loadUnits()));
 api.post('/enter', async (req, res) => {
-  const { token, expires } = await enterAsUnit(req.body?.unit_id, !!req.body?.view_only);
+  const { token, expires } = await enterAsUnit(req.body?.unit_id, !!req.body?.view_only, req.body?.password);
   res.setHeader('Set-Cookie', sessionCookie(token, expires));
   res.json({ user: publicUser(await userFromCookieHeader(`gantraah_sid=${token}`)) });
 });
+// the branch management password (only branch management, already signed in, can change it)
+api.put('/admin-password', admin, async (req, res) => {
+  const next = String(req.body?.next ?? '');
+  if (next.trim().length < 4) throw new HttpError(400, 'הסיסמה החדשה קצרה מדי (לפחות 4 תווים)');
+  await setAdminPassword(next);
+  await audit(req.user, { entity: 'settings', action: 'update', summary: 'הוחלפה הסיסמה של הנהלת הענף' });
+  res.json({ ok: true });
+});
+
+const unitChanged = (req, summary) => broadcast({ type: 'changed', by: req.user.display_name, summary });
+
+api.post('/units', admin, async (req, res) => {
+  const units = await loadUnits();
+  const parentId = intOr(req.body?.parent_id, null);
+  const parent = units.find((u) => u.id === parentId);
+  if (!parent) throw new HttpError(400, 'חסרה מסגרת אם');
+  const name = String(req.body?.name || '').trim();
+  if (!name) throw new HttpError(400, 'חסר שם');
+  const so = units.filter((u) => u.parent_id === parentId).reduce((m, u) => Math.max(m, u.sort_order + 1), 0);
+  const u = (await db.query('INSERT INTO units (parent_id, kind, name, head, sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [parentId, kindAtDepth(unitDepth(units, parentId) + 1), name, '', so]))[0];
+  await audit(req.user, { entity: 'unit', entity_id: u.id, action: 'create', summary: `נוספה מסגרת "${name}" תחת "${parent.name}"` });
+  unitChanged(req, `נוספה מסגרת "${name}"`);
+  res.json(u);
+});
+
 api.patch('/units/:id', admin, async (req, res) => {
   const id = idParam(req);
-  const u = (await db.query('SELECT * FROM units WHERE id=$1', [id]))[0];
-  if (!u) throw new HttpError(404, 'היחידה לא נמצאה');
-  const name = req.body?.name != null ? String(req.body.name).trim() : u.name;
-  const head = req.body?.head != null ? String(req.body.head).trim() : u.head;
+  const units = await loadUnits();
+  const u = units.find((x) => x.id === id);
+  if (!u) throw new HttpError(404, 'המסגרת לא נמצאה');
+  const b = req.body || {};
+  const name = b.name != null ? String(b.name).trim() : u.name;
   if (!name) throw new HttpError(400, 'חסר שם');
-  await db.query('UPDATE units SET name=$1, head=$2 WHERE id=$3', [name, head, id]);
-  await audit(req.user, { entity: 'unit', entity_id: id, action: 'update', summary: `עודכנה יחידה: "${u.name}" ← "${name}"${head !== u.head ? ` (ראש: ${head || '—'})` : ''}` });
-  broadcast({ type: 'changed', by: req.user.display_name, summary: '' });
+  const editAll = 'edit_all' in b ? !!b.edit_all : !!u.edit_all;
+  if (editAll && u.parent_id == null) throw new HttpError(400, 'הנהלת הענף עורכת הכול ממילא');
+  let parentId = u.parent_id;
+  const notes = [];
+  if ('parent_id' in b && intOr(b.parent_id, null) !== u.parent_id) {
+    parentId = intOr(b.parent_id, null);
+    if (u.parent_id == null) throw new HttpError(400, 'אי אפשר להזיז את הנהלת הענף');
+    const np = units.find((x) => x.id === parentId);
+    if (!np) throw new HttpError(400, 'המסגרת שאליה מעבירים לא נמצאה');
+    if (unitSubtree(units, id).has(parentId)) throw new HttpError(400, 'אי אפשר להעביר מסגרת אל תוך עצמה');
+    notes.push(`הועברה אל "${np.name}"`);
+  }
+  await db.tx(async (tx) => {
+    await tx.query('UPDATE units SET name=$1, parent_id=$2, edit_all=$3 WHERE id=$4', [name, parentId, editAll, id]);
+    if (parentId !== u.parent_id) {
+      const so = units.filter((x) => x.parent_id === parentId).reduce((m, x) => Math.max(m, x.sort_order + 1), 0);
+      await tx.query('UPDATE units SET sort_order=$1 WHERE id=$2', [so, id]);
+      // the kind follows the depth (section / team), for the unit and everything under it
+      const after = await loadUnits(tx);
+      for (const x of unitSubtree(after, id)) await tx.query('UPDATE units SET kind=$1 WHERE id=$2', [kindAtDepth(unitDepth(after, x)), x]);
+    }
+  });
+  if (name !== u.name) notes.push(`שם: "${u.name}" ← "${name}"`);
+  if (editAll !== !!u.edit_all) notes.push(editAll ? 'הרשאה: עורך (כל התוכנית)' : 'הרשאה: צופה (עורכת רק את המשימות שלה)');
+  if (notes.length) {
+    await audit(req.user, { entity: 'unit', entity_id: id, action: 'update', summary: `עודכנה מסגרת "${name}": ${notes.join(', ')}` });
+    unitChanged(req, '');
+  }
+  res.json({ ok: true });
+});
+
+api.delete('/units/:id', admin, async (req, res) => {
+  const id = idParam(req);
+  const units = await loadUnits();
+  const u = units.find((x) => x.id === id);
+  if (!u) throw new HttpError(404, 'המסגרת לא נמצאה');
+  if (u.parent_id == null) throw new HttpError(400, 'אי אפשר למחוק את הנהלת הענף');
+  const sub = unitSubtree(units, id);
+  const { sched } = await currentSchedule();
+  const open = [...sched.tasks.values()].filter((t) => t.owner_unit_id != null && sub.has(t.owner_unit_id) && t.percent < 100);
+  if (open.length) throw new HttpError(400, `אי אפשר למחוק: יש ${open.length === 1 ? 'משימה פתוחה אחת' : `${open.length} משימות פתוחות`} באחריות המסגרת או מתחתיה. קודם מעבירים אותן למסגרת אחרת.`);
+  await db.tx(async (tx) => {
+    // finished tasks stay in the plan and move to the unit above
+    for (const x of sub) await tx.query('UPDATE tasks SET owner_unit_id=$1 WHERE owner_unit_id=$2', [u.parent_id, x]);
+    await tx.query('DELETE FROM units WHERE id=$1', [id]);
+  });
+  await audit(req.user, { entity: 'unit', entity_id: id, action: 'delete', summary: `נמחקה מסגרת "${u.name}"${sub.size > 1 ? ` יחד עם ${sub.size - 1} מסגרות שמתחתיה` : ''}` });
+  unitChanged(req, `נמחקה מסגרת "${u.name}"`);
+  res.json({ ok: true });
+});
+
+// ------------------------------------------------------------------ favourites (kept per unit)
+api.post('/favorites', editor, async (req, res) => {
+  const taskId = intOr(req.body?.task_id, null);
+  if (!req.user.unit_id || taskId == null) throw new HttpError(400, 'לא ניתן לשמור מועדף');
+  if (req.body?.on === false) await db.query('DELETE FROM favorites WHERE unit_id=$1 AND task_id=$2', [req.user.unit_id, taskId]);
+  else await db.query('INSERT INTO favorites (unit_id, task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.unit_id, taskId]);
   res.json({ ok: true });
 });
 
@@ -82,6 +163,7 @@ const mustEdit = (req, units, sched, taskId, what = 'לערוך את המשימ�
 /** owner chosen by a non-admin must be their own unit or below it */
 const mustAssign = (req, units, ownerId) => {
   if (req.user.role === 'admin') return;
+  if (req.user.edit_all && ownerId != null) return; // may edit the whole plan, so may hand a task to any unit
   if (ownerId == null) throw new HttpError(403, 'רק הנהלת הענף יכולה להשאיר משימה בלי אחראי.');
   if (!isWithin(units, ownerId, req.user.unit_id)) throw new HttpError(403, 'אפשר להעביר אחריות רק ליחידה שלך או ליחידות שמתחתיה.');
 };
@@ -109,6 +191,8 @@ api.get('/data', viewer, async (req, res) => {
     db: db.kind,
     undo: await undoState(req.user),
     units: await loadUnits(),
+    unitDays: data.specialDays.filter((r) => r.unit_id != null && r.kind !== 'work'),
+    favorites: req.user.unit_id ? (await db.query('SELECT task_id FROM favorites WHERE unit_id=$1', [req.user.unit_id])).map((r) => r.task_id).filter((id) => sched.tasks.has(id)) : [],
   });
 });
 
@@ -178,7 +262,8 @@ api.post('/projects/:id/baseline', admin, async (req, res) => {
       await tx.query('UPDATE tasks SET baseline_start=$1, baseline_finish=$2 WHERE id=$3', [t.start, t.finish, t.id]);
       n++;
     }
-    return { audit: { entity: 'project', entity_id: id, project_id: id, action: 'baseline', summary: `נשמר קו בסיס לפרויקט "${p.name}" (${n} משימות)` } };
+    await tx.query('UPDATE projects SET baseline_at=now() WHERE id=$1', [id]);
+    return { audit: { entity: 'project', entity_id: id, project_id: id, action: 'baseline', summary: `נשמר תכנון מקורי לפרויקט "${p.name}" (${n} משימות)` } };
   });
   res.json({ ok: true });
 });
@@ -215,6 +300,12 @@ api.post('/tasks', editor, async (req, res) => {
     if (b.after_id != null) {
       const after = (await tx.query('SELECT * FROM tasks WHERE id=$1', [intOr(b.after_id, 0)]))[0];
       if (after && after.project_id === projectId && (after.parent_id ?? null) === parentId) sort = after.sort_order + 5;
+    }
+    if (sort == null && b.first) { // a new sub-task goes right under its parent
+      const r = parentId == null
+        ? await tx.query('SELECT coalesce(min(sort_order),0)-10 AS n FROM tasks WHERE project_id=$1 AND parent_id IS NULL', [projectId])
+        : await tx.query('SELECT coalesce(min(sort_order),0)-10 AS n FROM tasks WHERE parent_id=$1', [parentId]);
+      sort = r[0].n;
     }
     if (sort == null) {
       const r = parentId == null
@@ -351,6 +442,85 @@ api.delete('/tasks/:id', editor, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ------------------------------------------------------------------ import (from Excel / CSV, mapped in the browser)
+// One request = one change: the whole import is undone with a single "undo".
+// tasks: [{ key, parent_key, name, kind, duration, start, percent, owner_unit_id, deadline, notes }] parents first
+// deps:  [{ from, to, type, lag }] by key
+api.post('/import', editor, async (req, res) => {
+  const b = req.body || {};
+  const rows = Array.isArray(b.tasks) ? b.tasks.slice(0, 3000) : [];
+  if (!rows.length) throw new HttpError(400, 'אין משימות לייבוא');
+  const units = await loadUnits();
+  const isAdmin = req.user.role === 'admin';
+  if (b.new_project && !isAdmin) throw new HttpError(403, 'רק הנהלת הענף יכולה ליצור פרויקט חדש.');
+  // every owner must be one this unit may assign; without an owner, a unit's tasks are its own
+  const ownerOf = (r) => {
+    let o = r.owner_unit_id == null || r.owner_unit_id === '' ? null : intOr(r.owner_unit_id, null);
+    if (o != null && !units.some((u) => u.id === o)) o = null;
+    if (o == null && !isAdmin) o = req.user.unit_id;
+    mustAssign(req, units, o);
+    return o;
+  };
+  const owners = rows.map(ownerOf);
+  const { result } = await mutate(req.user, async (tx) => {
+    let projectId = intOr(b.project_id, null), pname;
+    if (b.new_project) {
+      const np = b.new_project;
+      if (!String(np.name || '').trim() || !isDate(np.start_date) || !np.start_date) throw new HttpError(400, 'חסר שם או תאריך התחלה לפרויקט החדש');
+      const so = (await tx.query('SELECT coalesce(max(sort_order),0)+1 AS n FROM projects'))[0].n;
+      const p = (await tx.query('INSERT INTO projects (name, start_date, color, description, sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [String(np.name).trim(), np.start_date, np.color || '#3b6fd8', 'יובא מקובץ', so]))[0];
+      projectId = p.id; pname = p.name;
+    } else {
+      const p = (await tx.query('SELECT * FROM projects WHERE id=$1', [projectId]))[0];
+      if (!p) throw new HttpError(404, 'הפרויקט לא נמצא');
+      pname = p.name;
+    }
+    const idOf = new Map();
+    const base = (await tx.query('SELECT coalesce(max(sort_order),0) AS n FROM tasks WHERE project_id=$1 AND parent_id IS NULL', [projectId]))[0].n;
+    const order = new Map(); // sort order per parent
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const name = String(r.name || '').trim().slice(0, 300);
+      if (!name) continue;
+      const parentId = r.parent_key != null && idOf.has(String(r.parent_key)) ? idOf.get(String(r.parent_key)) : null;
+      const pk = parentId ?? 'root';
+      const n = (order.get(pk) ?? (parentId == null ? base : 0)) + 10;
+      order.set(pk, n);
+      const kind = r.kind === 'milestone' ? 'milestone' : 'task';
+      const duration = kind === 'milestone' ? 0 : Math.max(1, Math.min(5000, intOr(r.duration, 1)));
+      const t = (await tx.query(
+        `INSERT INTO tasks (project_id, parent_id, sort_order, name, kind, duration, start_constraint, percent, owner, owner_unit_id, notes, deadline)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'',$9,$10,$11) RETURNING id`,
+        [projectId, parentId, n, name, kind, duration, isDate(r.start) && r.start ? r.start : null,
+          Math.max(0, Math.min(100, intOr(r.percent, 0))), owners[i], String(r.notes || '').slice(0, 20000),
+          kind !== 'milestone' && isDate(r.deadline) && r.deadline ? r.deadline : null]))[0];
+      idOf.set(String(r.key), t.id);
+    }
+    // dependencies: skip anything that does not make sense (unknown, itself, between a task and its parent, twice)
+    const parent = new Map();
+    for (const r of rows) if (idOf.has(String(r.key)) && r.parent_key != null && idOf.has(String(r.parent_key))) parent.set(idOf.get(String(r.key)), idOf.get(String(r.parent_key)));
+    const anc = (id) => { const out = []; for (let x = parent.get(id); x != null; x = parent.get(x)) out.push(x); return out; };
+    const seen = new Set();
+    let deps = 0;
+    for (const d of Array.isArray(b.deps) ? b.deps.slice(0, 10000) : []) {
+      const p = idOf.get(String(d.from)), s = idOf.get(String(d.to));
+      if (p == null || s == null || p === s || anc(s).includes(p) || anc(p).includes(s)) continue;
+      const k = p < s ? `${p}-${s}` : `${s}-${p}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      await tx.query('INSERT INTO dependencies (predecessor_id, successor_id, type, lag) VALUES ($1,$2,$3,$4)',
+        [p, s, DEP_TYPES.includes(d.type) ? d.type : 'FS', Math.max(-500, Math.min(500, intOr(d.lag, 0)))]);
+      deps++;
+    }
+    return {
+      result: { project_id: projectId, tasks: idOf.size, deps },
+      audit: { entity: 'project', entity_id: projectId, project_id: projectId, action: 'create', summary: `יובאו ${idOf.size} משימות${deps ? ` ו-${deps} תלויות` : ''} מקובץ אל "${pname}"${b.file ? ` (${String(b.file).slice(0, 80)})` : ''}` },
+    };
+  });
+  res.json(result);
+});
+
 // ------------------------------------------------------------------ dependencies
 api.post('/dependencies', editor, async (req, res) => {
   const b = req.body || {};
@@ -427,14 +597,30 @@ api.post('/simulate', viewer, async (req, res) => {
 });
 
 // ------------------------------------------------------------------ history
+function historyWhere(q) {
+  const where = [`at >= now() - make_interval(days => ${HISTORY_DAYS})`], vals = [];
+  const add = (col, v) => { vals.push(v); where.push(`${col}=$${vals.length}`); };
+  if (q.task_id) add('task_id', intOr(q.task_id, 0));
+  if (q.project_id) add('project_id', intOr(q.project_id, 0));
+  if (q.user) add('user_name', String(q.user));
+  if (q.action) add('action', String(q.action));
+  return { where, vals };
+}
+// newest first; "before" (an id) gives the next page
 api.get('/history', viewer, async (req, res) => {
-  const where = [], vals = [];
-  if (req.query.task_id) { vals.push(intOr(req.query.task_id, 0)); where.push(`task_id=$${vals.length}`); }
-  if (req.query.project_id) { vals.push(intOr(req.query.project_id, 0)); where.push(`project_id=$${vals.length}`); }
+  const { where, vals } = historyWhere(req.query);
+  if (req.query.before) { vals.push(intOr(req.query.before, 0)); where.push(`id < $${vals.length}`); }
   const limit = Math.max(1, Math.min(1000, intOr(req.query.limit, 200)));
-  const rows = await db.query(
-    `SELECT * FROM audit_log ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ${limit}`, vals);
-  res.json(rows);
+  res.json(await db.query(`SELECT * FROM audit_log WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ${limit}`, vals));
+});
+// for the history page: how many entries match the filter, who changed things, which actions, how long history is kept
+api.get('/history/meta', viewer, async (req, res) => {
+  const { where, vals } = historyWhere(req.query);
+  const all = historyWhere({}).where.join(' AND ');
+  const [{ n }] = await db.query(`SELECT count(*)::int AS n FROM audit_log WHERE ${where.join(' AND ')}`, vals);
+  const people = (await db.query(`SELECT DISTINCT user_name FROM audit_log WHERE ${all}`)).map((r) => r.user_name).filter(Boolean);
+  const actions = (await db.query(`SELECT DISTINCT action FROM audit_log WHERE ${all}`)).map((r) => r.action);
+  res.json({ count: n, people, actions, days: HISTORY_DAYS });
 });
 
 // ------------------------------------------------------------------ calendar
@@ -444,41 +630,65 @@ api.get('/calendar', viewer, async (req, res) => {
   const from = toDay(`${year}-01-01`), to = toDay(`${year}-12-31`);
   const s = computeSchedule({ ...data, tasks: [], deps: [] });
   const holidays = holidaysInRange(from, to).map((h) => ({ ...h, off: !s.cal.isWork(toDay(h.day)) }));
-  res.json({ settings: data.calendarSettings, defaults: DEFAULT_CALENDAR, exceptions: data.calendarExceptions, holidays, year });
+  res.json({ settings: data.calendarSettings, defaults: DEFAULT_CALENDAR, specialDays: data.specialDays, holidays, year });
 });
 
 api.put('/calendar', admin, async (req, res) => {
   const b = req.body || {};
   const value = {
-    workDays: Array.isArray(b.workDays) ? b.workDays.map(Number).filter((d) => d >= 0 && d <= 6) : DEFAULT_CALENDAR.workDays,
+    workDays: DEFAULT_CALENDAR.workDays, // fixed: Sunday to Thursday
     chagOff: !!b.chagOff, independenceOff: !!b.independenceOff, cholHamoedOff: !!b.cholHamoedOff, erevChagOff: !!b.erevChagOff,
   };
-  if (!value.workDays.length) throw new HttpError(400, 'חייב להיות לפחות יום עבודה אחד בשבוע');
   await mutate(req.user, async (tx) => {
     await tx.query(`INSERT INTO settings (key, value) VALUES ('calendar', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify(value)]);
-    return { audit: { entity: 'calendar', action: 'update', summary: 'עודכנו הגדרות לוח העבודה' } };
+    return { audit: { entity: 'calendar', action: 'update', summary: 'עודכנו הגדרות החגים' } };
   });
   res.json({ ok: true });
 });
 
-api.post('/calendar/exceptions', admin, async (req, res) => {
+const rangeText = (a, b) => (a === b ? a : `${a} עד ${b}`);
+
+/**
+ * Special days. Branch management: for everyone (unit_id null) or for one unit.
+ * Any other unit: days off for itself or a unit below it, which apply only to those units' tasks.
+ */
+api.post('/calendar/special', editor, async (req, res) => {
   const b = req.body || {};
-  if (!b.day || !isDate(b.day)) throw new HttpError(400, 'תאריך לא תקין');
+  if (!b.start_day || !isDate(b.start_day)) throw new HttpError(400, 'תאריך לא תקין');
+  const end = b.end_day && isDate(b.end_day) ? b.end_day : b.start_day;
+  if (end < b.start_day) throw new HttpError(400, 'תאריך הסיום לפני תאריך ההתחלה');
+  if (toDay(end) - toDay(b.start_day) > 366) throw new HttpError(400, 'הטווח ארוך מדי');
+  const units = await loadUnits();
+  const isAdmin = req.user.role === 'admin';
+  let unitId = b.unit_id == null || b.unit_id === '' ? null : intOr(b.unit_id, null);
+  const root = units.find((u) => u.parent_id == null);
+  if (unitId === root?.id) unitId = null; // the branch's own day is everyone's day
+  if (!isAdmin) {
+    if (unitId == null) unitId = req.user.unit_id;
+    if (!isWithin(units, unitId, req.user.unit_id)) throw new HttpError(403, 'אפשר להוסיף ימים מיוחדים רק למסגרת שלך או למסגרות שמתחתיה.');
+  }
+  if (b.kind === 'work' && unitId != null) throw new HttpError(400, 'יום עבודה מיוחד אפשר להגדיר רק לכל הענף');
   const kind = b.kind === 'work' ? 'work' : 'off';
+  const unitName = unitId == null ? 'כל הענף' : units.find((u) => u.id === unitId)?.name;
   await mutate(req.user, async (tx) => {
-    await tx.query(`INSERT INTO calendar_exceptions (day, kind, label) VALUES ($1,$2,$3)
-      ON CONFLICT (day) DO UPDATE SET kind=EXCLUDED.kind, label=EXCLUDED.label`, [b.day, kind, String(b.label || '').slice(0, 100)]);
-    return { audit: { entity: 'calendar', action: 'update', summary: `${b.day} הוגדר כ${kind === 'work' ? 'יום עבודה' : 'יום חופש'}${b.label ? ` (${b.label})` : ''}` } };
+    await tx.query('INSERT INTO special_days (unit_id, start_day, end_day, kind, label) VALUES ($1,$2,$3,$4,$5)',
+      [unitId, b.start_day, end, kind, String(b.label || '').slice(0, 100)]);
+    return { audit: { entity: 'calendar', action: 'create', summary: `${rangeText(b.start_day, end)}: ${kind === 'work' ? 'יום עבודה' : 'יום חופש'} ל${unitName}${b.label ? ` (${b.label})` : ''}` } };
   });
   res.json({ ok: true });
 });
 
-api.delete('/calendar/exceptions/:day', admin, async (req, res) => {
-  const day = req.params.day;
-  if (!isDate(day)) throw new HttpError(400, 'תאריך לא תקין');
+api.delete('/calendar/special/:id', editor, async (req, res) => {
+  const id = idParam(req);
+  const units = await loadUnits();
   await mutate(req.user, async (tx) => {
-    await tx.query('DELETE FROM calendar_exceptions WHERE day=$1', [day]);
-    return { audit: { entity: 'calendar', action: 'delete', summary: `בוטלה החריגה בלוח העבודה ב-${day}` } };
+    const r = (await tx.query('SELECT * FROM special_days WHERE id=$1', [id]))[0];
+    if (!r) throw new HttpError(404, 'היום המיוחד לא נמצא');
+    if (req.user.role !== 'admin' && (r.unit_id == null || !isWithin(units, r.unit_id, req.user.unit_id))) {
+      throw new HttpError(403, 'אפשר להסיר רק ימים מיוחדים של המסגרת שלך או של המסגרות שמתחתיה.');
+    }
+    await tx.query('DELETE FROM special_days WHERE id=$1', [id]);
+    return { audit: { entity: 'calendar', action: 'delete', summary: `הוסר יום מיוחד: ${rangeText(isoDate(r.start_day), isoDate(r.end_day))}${r.label ? ` (${r.label})` : ''}` } };
   });
   res.json({ ok: true });
 });

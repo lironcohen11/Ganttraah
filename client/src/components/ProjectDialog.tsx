@@ -2,9 +2,13 @@ import { useState } from 'react';
 import { useApp } from '../ctx';
 import { api } from '../api';
 import type { Project } from '../types';
-import { fmtDate } from '../dates';
+import { fmtDate, fmtDateTime } from '../dates';
 
-export const PROJECT_COLORS = ['#3b6fd8', '#0f9d76', '#c2410c', '#7c3aed', '#be185d', '#0e7490', '#a16207', '#475569'];
+export const PROJECT_COLORS = [
+  '#3b6fd8', '#2563eb', '#0e7490', '#0891b2', '#0f9d76', '#16a34a', '#65a30d', '#a16207',
+  '#ca8a04', '#ea580c', '#c2410c', '#dc2626', '#be185d', '#db2777', '#9333ea', '#7c3aed',
+  '#4f46e5', '#475569', '#57534e', '#1e293b',
+];
 
 export function ProjectDialog({ project, onClose }: { project: Project | null; onClose: (createdId?: number) => void }) {
   const { run, isAdmin, model } = useApp();
@@ -32,8 +36,11 @@ export function ProjectDialog({ project, onClose }: { project: Project | null; o
           <input type="date" value={start} onChange={(e) => setStart(e.target.value)} />
           <span className="f-hint">משימות בלי תלויות יתחילו בתאריך הזה.</span></label>
         <div className="field"><span className="f-label">צבע</span>
-          <div className="swatches">
-            {PROJECT_COLORS.map((c) => <button key={c} className={`sw ${c === color ? 'on' : ''}`} style={{ background: c }} onClick={() => setColor(c)} aria-label={c} />)}
+          <div className="swatches many">
+            {PROJECT_COLORS.map((c) => <button key={c} className={`sw ${c.toLowerCase() === color.toLowerCase() ? 'on' : ''}`} style={{ background: c }} onClick={() => setColor(c)} aria-label={c} />)}
+            <label className={`sw custom ${!PROJECT_COLORS.some((c) => c.toLowerCase() === color.toLowerCase()) ? 'on' : ''}`} title="צבע אחר" style={!PROJECT_COLORS.some((c) => c.toLowerCase() === color.toLowerCase()) ? { background: color } : undefined}>
+              <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />+
+            </label>
           </div></div>
         <label className="field"><span className="f-label">תיאור</span>
           <textarea rows={2} value={desc} onChange={(e) => setDesc(e.target.value)} /></label>
@@ -42,10 +49,16 @@ export function ProjectDialog({ project, onClose }: { project: Project | null; o
           <div className="sec">
             <h3>תכנון מול ביצוע</h3>
             <p className="muted small">הכפתור שומר את התאריכים של היום כ"תכנון המקורי". אחר כך, כשהתיבה "תכנון מול ביצוע" מסומנת, רואים בגאנט פס אפור דק מתחת לכל משימה: איפה היא תוכננה במקור, לעומת איפה היא עכשיו.
-              {project.baseline_finish && <> התכנון המקורי השמור מסתיים ב-{fmtDate(project.baseline_finish)}.</>}</p>
+</p>
             <button className="btn" onClick={() => {
-              if (!project.baseline_finish || confirm('להחליף את התכנון המקורי השמור בתאריכים הנוכחיים?')) run(() => api.post(`/projects/${project.id}/baseline`), 'התכנון המקורי נשמר');
-            }}>שמירת התאריכים הנוכחיים כתכנון המקורי</button>
+              if (!project.baseline_finish || confirm('להחליף את ה-Baseline השמור במצב התכנון הנוכחי?')) run(() => api.post(`/projects/${project.id}/baseline`), 'ה-Baseline נשמר');
+            }}>שמירת Baseline (מצב התכנון)</button>
+            <div className="baseline-info">
+              {project.baseline_finish ? <>
+                <div>תאריך שמירה קודם: <b>{project.baseline_at ? fmtDateTime(project.baseline_at) : 'לא ידוע'}</b></div>
+                <div>לפיו הפרויקט מסתיים ב-<b>{fmtDate(project.baseline_finish)}</b>.</div>
+              </> : <div className="muted">עוד לא נשמר Baseline לפרויקט הזה.</div>}
+            </div>
           </div>
         )}
 
