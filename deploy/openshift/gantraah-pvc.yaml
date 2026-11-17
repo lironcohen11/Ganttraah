@@ -1,0 +1,101 @@
+# Ganttraah on OpenShift 4.x WITHOUT a PostgreSQL server: the embedded database, kept on a
+# PersistentVolumeClaim. The data stays when the pod is deleted or moved, because it lives on the
+# volume and not in the container. (Deleting the PVC itself deletes the data: back it up.)
+#
+#   1. Set the image name (and the storage class if your cluster needs one), then:
+#        oc apply -f gantraah-pvc.yaml
+#   2. Open the route: oc get route gantraah
+#
+# The embedded database may be opened by one process only: one pod, and "Recreate" so the old pod
+# is gone before the new one starts.
+# Like any PostgreSQL, it opens only under the user id that created it. OpenShift runs every pod of
+# a project with the project's fixed user id, so a deleted or moved pod reopens it. Moving the data
+# to ANOTHER project (another user id) needs the files' owner changed, or an external PostgreSQL.
+# Tested (as on OpenShift, random non-root user): data kept after deleting the pod, and after a hard kill.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gantraah-data
+  labels: { app: gantraah }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 2Gi }
+  # storageClassName: <your storage class>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gantraah
+  labels: { app: gantraah }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: gantraah } }
+  template:
+    metadata:
+      labels: { app: gantraah }
+    spec:
+      # time to finish the change in progress and close the database cleanly when the pod stops
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gantraah
+          image: image-registry.openshift-image-registry.svc:5000/<project>/gantraah:1.7
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: DATA_DIR, value: /data/pglite }
+            - { name: COOKIE_SECURE, value: "true" }
+            - { name: TZ_NAME, value: Asia/Jerusalem }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          # the first start creates the database: give it time before the other probes count
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 384Mi }
+            limits: { memory: 1536Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: gantraah-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gantraah
+  labels: { app: gantraah }
+spec:
+  selector: { app: gantraah }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: gantraah
+  labels: { app: gantraah }
+  annotations:
+    haproxy.router.openshift.io/timeout: 1h
+spec:
+  to: { kind: Service, name: gantraah }
+  port: { targetPort: http }
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

@@ -30,6 +30,10 @@ export interface Task {
   children: number[];
   critical: boolean;
   float: number | null;
+  /** free slack: work days the task can move later without moving any other task or its project's end */
+  free_float?: number | null;
+  /** the latest finish within that slack */
+  free_until?: string | null;
   expected_percent: number;
   status: Status;
   deadline_missed: boolean;
@@ -56,6 +60,9 @@ export interface Project {
   behind_count: number;
   deadline_issues: number;
   baseline_finish: string | null;
+  /** the estimated finish date set for the project, and whether the plan ends after it */
+  target_finish?: string | null;
+  target_missed?: boolean;
   /** when the original plan was last saved */
   baseline_at?: string | null;
   cost_total: number | null;
@@ -81,8 +88,36 @@ export interface AppData {
   units: Unit[];
   /** special days off of one unit (and the units below it) */
   unitDays: UnitDay[];
+  /** updates in the bell that the unit has not seen yet */
+  notif_unread?: number;
   /** favourite task ids of the unit you entered as */
   favorites: number[];
+  /** the latest postponement of each task that was postponed */
+  delays?: Delay[];
+  /** ask why a task with an original plan is postponed (branch management can turn it off) */
+  delay_reasons?: boolean;
+  /** the task pool: tasks with no date yet, not in the plan */
+  backlog?: BacklogItem[];
+}
+
+/** a task in the pool (backlog): no date yet, not scheduled, not in the Gantt */
+export interface BacklogItem {
+  id: number;
+  name: string;
+  notes: string;
+  /** the project it is expected to go to (may be unknown) */
+  project_id: number | null;
+  owner_unit_id: number | null;
+  /** estimated work days (optional) */
+  duration: number | null;
+  sort_order: number;
+}
+
+/** a task's finish moved later: why (a reason from the list), or because a task it depends on moved (cause_task_id) */
+export interface Delay {
+  id: number; at: string; task_id: number; unit_id: number | null; user_name: string;
+  reason: string | null; reason_other: string; description: string; cause_task_id: number | null;
+  from_finish: string | null; to_finish: string | null;
 }
 
 export interface UnitDay { id: number; unit_id: number; start_day: string; end_day: string; kind: 'off' | 'work'; label: string }

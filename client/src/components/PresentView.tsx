@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../ctx';
+import { sampleModel } from '../tourSample';
 import type { Model } from '../model';
+import { doneCount } from '../model';
 import type { Task } from '../types';
 import { fmtDate, fmtLong, fmtMonth, toDay, daysText } from '../dates';
 import { Icon } from './Icon';
@@ -34,10 +36,22 @@ function lightOf(m: Model, t: Task): Light {
   return 'ok';
 }
 
-interface MRow { projectId?: number; key: string; kind: 'project' | 'phase' | 'task' | 'milestone'; name: string; start: string; finish: string; pct: number; light: Light; color: string; depth: number; taskId?: number; hasKids: boolean }
+interface MRow { target?: string | null; targetMissed?: boolean; projectId?: number; key: string; kind: 'project' | 'phase' | 'task' | 'milestone'; name: string; start: string; finish: string; pct: number; light: Light; color: string; depth: number; taskId?: number; hasKids: boolean }
 
 export function PresentView() {
-  const { model, user } = useApp();
+  const { model: appModel, user } = useApp();
+  // the tour in an empty system shows a sample project: on screen only, nothing is saved
+  const [sample, setSample] = useState<Model | null>(null);
+  useEffect(() => {
+    const h = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      if (d === 'sample-on' && !appModel.data.tasks.length) setSample(sampleModel(appModel.data.today));
+      else if (d === 'sample-off' || d === 'end') setSample(null);
+    };
+    window.addEventListener('gantraah-tour', h);
+    return () => window.removeEventListener('gantraah-tour', h);
+  }, [appModel]);
+  const model = sample ?? appModel;
   const [favOnly, setFavOnly] = useState<boolean>(() => ls.get('favOnly', false));
   useEffect(() => ls.set('favOnly', favOnly), [favOnly]);
   const favs = favOnly && user.unit_id != null ? model.favorites : null;
@@ -133,9 +147,9 @@ export function PresentView() {
         .filter((t) => (whole || picks.includes('t:' + t.id)) && ownerOk(t.id));
       if (!roots.length) continue;
       const all = roots.flatMap((r) => [...model.subtree(r.id)].map((id) => model.task(id)!));
-      const light: Light = p.percent >= 100 ? 'done' : all.some((x) => x.status === 'late' || x.deadline_missed) ? 'late'
+      const light: Light = p.percent >= 100 ? 'done' : all.some((x) => x.status === 'late' || x.deadline_missed) || p.target_missed ? 'late'
         : all.some((x) => x.status === 'behind') ? 'risk' : 'ok';
-      out.push({ key: 'p' + p.id, kind: 'project', name: p.name, start: p.start, finish: p.finish, pct: p.percent, light, color: p.color, depth: 0, hasKids: true, projectId: p.id });
+      out.push({ key: 'p' + p.id, kind: 'project', name: p.name, start: p.start, finish: p.finish, pct: p.percent, light, color: p.color, depth: 0, hasKids: true, projectId: p.id, target: p.target_finish, targetMissed: p.target_missed });
       for (const t of roots) { out.push(taskRow(t, 1, true)); addKids(t, 2); }
     }
     return out;
@@ -148,14 +162,18 @@ export function PresentView() {
     for (const r of rows) if (r.taskId) for (const x of model.subtree(r.taskId)) ids.add(x);
     const tasks = [...ids].map((id) => model.task(id)!);
     const leaves = tasks.filter((t) => t.kind !== 'summary');
-    const w = leaves.reduce((s, t) => s + (t.kind === 'milestone' ? 0 : t.work_days), 0);
-    const pct = w ? Math.round(leaves.reduce((s, t) => s + t.percent * (t.kind === 'milestone' ? 0 : t.work_days), 0) / w) : 0;
+    // this version: a task is done or not, so progress = how many of the tasks are done
+    const done = leaves.filter((t) => t.percent >= 100).length, total = leaves.length;
+    const pct = total ? Math.round((done / total) * 100) : 0;
     const finish = tasks.reduce((m, t) => (t.finish > m ? t.finish : m), '');
     const bl = tasks.reduce((m, t) => (t.baseline_finish && t.baseline_finish > m ? t.baseline_finish : m), '');
     const late = leaves.filter((t) => t.status === 'late' || t.deadline_missed).length;
     const risk = leaves.filter((t) => t.status === 'behind').length;
     const next = tasks.filter((t) => t.kind === 'milestone' && t.percent < 100 && t.finish >= model.data.today).sort((a, b) => a.finish.localeCompare(b.finish))[0];
-    return { pct, finish, slip: bl && finish ? toDay(finish) - toDay(bl) : null, late, risk, next };
+    // the estimated finish: the latest one of the projects shown
+    const shownProjects = [...new Set(rows.filter((r) => r.projectId != null).map((r) => r.projectId!))].map((id) => model.project(id)!);
+    const target = shownProjects.every((p) => p.target_finish) && shownProjects.length ? shownProjects.reduce((m, p) => (p.target_finish! > m ? p.target_finish! : m), '') : null;
+    return { pct, done, total, finish, slip: bl && finish ? toDay(finish) - toDay(bl) : null, late, risk, next, target };
   }, [rows, model]);
 
   const title = favs ? 'המועדפים' : picks.length === 1
@@ -266,15 +284,16 @@ export function PresentView() {
       <section className={`meet-kpis ${kpiH != null && kpiH < 110 ? 'compact' : ''}`} data-tour="m-kpis" ref={kpiRef}
         style={kpiH != null ? ({ height: kpiH, '--kz': Math.max(0.55, Math.min(1, kpiH / 150)) } as React.CSSProperties) : undefined}>
         <div className="mk">
-          <span className="mk-label">התקדמות</span>
-          <span className="mk-val">{kpi.pct}%</span>
+          <span className="mk-label">הושלמו</span>
+          <span className="mk-val">{kpi.done}<small> מתוך {kpi.total}</small></span>
           <div className="mk-bar"><i style={{ width: `${kpi.pct}%` }} /></div>
-          <span className="mk-sub" title="ממוצע ההתקדמות של כל המשימות שבתצוגה. משימה ארוכה משפיעה יותר (לפי מספר ימי העבודה שלה). אבני דרך לא נספרות.">ממוצע של כל המשימות, לפי המשך שלהן</span>
+          <span className="mk-sub" title="כמה מהמשימות שבתצוגה (כולל אבני דרך) סומנו כהושלמו.">מכל המשימות שבתצוגה</span>
         </div>
         <div className="mk">
           <span className="mk-label">סיום צפוי</span>
           <span className="mk-val">{fmtDate(kpi.finish)}</span>
           {kpi.slip != null && <span className={`mk-sub ${kpi.slip > 0 ? 'late' : 'ok'}`}>{kpi.slip > 0 ? `${daysText(kpi.slip)} אחרי התכנון` : kpi.slip < 0 ? `${daysText(kpi.slip)} לפני התכנון` : 'לפי התכנון'}</span>}
+          {kpi.target && <span className={`mk-sub ${kpi.finish > kpi.target ? 'late' : 'ok'}`}>יעד: {fmtDate(kpi.target)}{kpi.finish > kpi.target ? ` · ${daysText(toDay(kpi.finish) - toDay(kpi.target))} אחריו` : ''}</span>}
         </div>
         <div className={`mk ${kpi.late ? 'late' : kpi.risk ? 'risk' : 'ok'}`}>
           <span className="mk-label">דורש תשומת לב</span>
@@ -405,11 +424,11 @@ function TaskDetails({ m, stack, onOpen, onBack, onClose }: {
         <div className="td-stats">
           <div><span>מצב</span><b><span className={`mt-light ${light}`}>{LIGHT_LABEL[light]}</span></b></div>
           <div><span>{t.kind === 'milestone' ? 'תאריך' : 'תאריכים'}</span><b>{t.kind === 'milestone' ? fmtDate(t.finish) : `${fmtDate(t.start)} – ${fmtDate(t.finish)}`}</b></div>
-          {t.kind !== 'milestone' && <div><span>התקדמות</span><b>{t.percent}%</b></div>}
+          <div><span>{t.children.length ? 'הושלמו' : 'ביצוע'}</span><b>{t.children.length ? (() => { const c = doneCount(m, [t.id]); return `${c.done} מתוך ${c.total}`; })() : t.percent >= 100 ? (t.kind === 'milestone' ? 'הושגה' : 'הושלמה') : 'עוד לא'}</b></div>
           {owner && <div><span>אחראי</span><b>{owner}</b></div>}
           {t.deadline && <div><span>תאריך יעד</span><b className={t.deadline_missed ? 'bad' : ''}>{fmtDate(t.deadline)}</b></div>}
         </div>
-        {t.kind !== 'milestone' && <div className="mk-bar"><i style={{ width: `${t.percent}%` }} /></div>}
+        {t.children.length > 0 && <div className="mk-bar"><i style={{ width: `${t.percent}%` }} /></div>}
         <LinkStrip m={m} taskId={t.id} onOpen={onOpen} />
       </div>
     </div>
@@ -473,7 +492,7 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
   const chartW = Math.max(200, w - NAME_W);
   const t0 = toDay(today);
   let lo = t0, hi = t0;
-  for (const r of rows) { lo = Math.min(lo, toDay(r.start)); hi = Math.max(hi, toDay(r.finish)); }
+  for (const r of rows) { lo = Math.min(lo, toDay(r.start)); hi = Math.max(hi, toDay(r.finish)); if (r.target) hi = Math.max(hi, toDay(r.target)); }
   const pad = Math.max(7, Math.round((hi - lo) * 0.04));
   lo -= pad; hi += pad;
   const span = Math.max(1, hi - lo + 1);
@@ -515,7 +534,8 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
           const isOpen = r.taskId != null && open.has(r.taskId);
           const h = heights[i];
           // name first, then progress and finish date (the project row already shows its name on the side)
-          const label = r.kind === 'project' ? `${r.pct}%` : `${r.name} · ${r.pct}% · ${fmtDate(r.finish)}`;
+          const c = r.kind === 'project' ? doneCount(model, model.project(r.projectId!)?.roots || []) : r.hasKids && r.taskId ? doneCount(model, [r.taskId]) : null;
+          const label = r.kind === 'project' ? `${c!.done}/${c!.total}` : `${r.name} · ${c ? `${c.done}/${c.total}` : r.pct >= 100 ? '✓' : ''}${c || r.pct >= 100 ? ' · ' : ''}${fmtDate(r.finish)}`;
           const inside = bw > label.length * 8.6 + 26;
           return (
             <div key={r.key} className={`mt-row k-${r.kind} ${r.hasKids && r.taskId ? 'clickable' : ''} ${pop === i ? 'popped' : ''} ${tourFocus != null && r.taskId != null && (r.taskId === tourFocus || model.ancestors(r.taskId).includes(tourFocus)) ? 'tour-hl' : ''}`}
@@ -542,6 +562,17 @@ function Timeline({ rows, today, onToggle, open, model, onOpenTask, tourFocus }:
                     {inside
                       ? <text x={right - 12} y={h / 2} dy="0.35em" className={`mt-label ${r.pct >= 25 ? 'in' : 'in-dark'}`}>{label}</text>
                       : <text x={left - 10} y={h / 2} dy="0.35em" className="mt-label out">{label}</text>}
+                    {r.target && (() => {
+                      const tx = x(toDay(r.target) + 1);
+                      const c = r.targetMissed ? 'var(--bad)' : 'var(--g-deadline)';
+                      return (
+                        <g>
+                          <line x1={tx} x2={tx} y1={h * 0.12} y2={h * 0.88} stroke={c} strokeWidth="2.5" />
+                          <path d={`M${tx},${h * 0.12}h-14l4,6l-4,6h14z`} fill={c} />
+                          <title>{`סיום משוער: ${fmtLong(r.target)}${r.targetMissed ? ' · התוכנית מסתיימת מאוחר יותר' : ''}`}</title>
+                        </g>
+                      );
+                    })()}
                   </g>
                 )}
               </svg>
@@ -620,3 +651,4 @@ function HowClick() {
     </svg>
   );
 }
+

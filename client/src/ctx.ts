@@ -22,7 +22,15 @@ export interface Ctx {
   sim: SimOverlay | null;
   /** add / remove a task from the favourites of the unit you entered as */
   toggleFavorite: (id: number) => void;
+  /** the task card this tab shows (null: none), told to everyone */
+  setViewing: (taskId: number | null) => void;
+  /** the other tabs that show this task card now: their unit's name, one entry per tab */
+  viewersOf: (taskId: number) => string[];
+  /** the latest change someone else made (seq grows with every one) */
+  remote: RemoteChange | null;
 }
+
+export interface RemoteChange { seq: number; at: number; by: string; task_id: number | null; summary: string }
 
 export interface SimOverlay {
   taskId: number;

@@ -1,0 +1,97 @@
+# Ganttraah on OpenShift 4.x with an EXTERNAL PostgreSQL (15 or newer). Recommended.
+# All the data is in the database, so deleting or moving the pod loses nothing.
+#
+#   1. Fill in the Secret below (DATABASE_URL) and the image name, then:
+#        oc apply -f gantraah-postgres.yaml
+#   2. Open the route: oc get route gantraah
+#
+# The image: build it from the Dockerfile at the root of the project and push it to the cluster's
+# registry (see README.md). Replace <project> with your OpenShift project (namespace).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gantraah-db
+  labels: { app: gantraah }
+type: Opaque
+stringData:
+  # postgres://<user>:<password>@<host>:5432/<database>
+  DATABASE_URL: "postgres://gantraah:CHANGE-ME@db.example.local:5432/gantraah"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gantraah
+  labels: { app: gantraah }
+spec:
+  # ONE pod: the live updates between users are kept in the server's memory
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: gantraah } }
+  template:
+    metadata:
+      labels: { app: gantraah }
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: gantraah
+          image: image-registry.openshift-image-registry.svc:5000/<project>/gantraah:1.7
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: gantraah-db, key: DATABASE_URL } }
+            # the route below is HTTPS: the login cookie is sent over HTTPS only
+            - { name: COOKIE_SECURE, value: "true" }
+            - { name: TZ_NAME, value: Asia/Jerusalem }
+            # encryption to the database: "" (as the URL says) / "require" / "verify" (+ DB_SSL_CA)
+            - { name: DB_SSL, value: "" }
+          volumeMounts:
+            - { name: tmp-data, mountPath: /data }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+      volumes:
+        # nothing important is written here when the data is in PostgreSQL
+        - { name: tmp-data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gantraah
+  labels: { app: gantraah }
+spec:
+  selector: { app: gantraah }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: gantraah
+  labels: { app: gantraah }
+  annotations:
+    # live updates stay open on one WebSocket connection (/ws): do not cut it after 30 seconds
+    haproxy.router.openshift.io/timeout: 1h
+spec:
+  # host: gantraah.apps.example.local   # optional: a fixed address
+  to: { kind: Service, name: gantraah }
+  port: { targetPort: http }
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

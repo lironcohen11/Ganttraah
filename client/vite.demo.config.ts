@@ -6,7 +6,8 @@ import { viteSingleFile } from 'vite-plugin-singlefile';
 
 export default defineConfig({
   plugins: [react(), viteSingleFile()],
-  define: { 'import.meta.env.VITE_DEMO': JSON.stringify('1') },
+  // DEMO_EMPTY=1: the same file without the sample projects (stored separately in the browser)
+  define: { 'import.meta.env.VITE_DEMO': JSON.stringify('1'), 'import.meta.env.VITE_DEMO_EMPTY': JSON.stringify(process.env.DEMO_EMPTY === '1' ? '1' : '0') },
   base: './',
   build: { outDir: 'dist-demo', emptyOutDir: true, assetsInlineLimit: 100_000_000, chunkSizeWarningLimit: 5000 },
 });

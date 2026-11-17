@@ -11,27 +11,61 @@ import seed from './seed.json';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Any = any;
-class HttpError extends Error { constructor(public status: number, message: string) { super(message); } }
+class HttpError extends Error { constructor(public status: number, message: string, public data?: Any) { super(message); } }
 
-const KEY = 'gantraah.demo.v1';
+const KEY = import.meta.env.VITE_DEMO_EMPTY === '1' ? 'gantraah.demo.empty.v2' : 'gantraah.demo.v2'; // v2: original plans and postponements
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x));
 
-interface Core { projects: Any[]; tasks: Any[]; deps: Any[]; calendarSettings: Any; specialDays: Any[] }
+interface Core { projects: Any[]; tasks: Any[]; deps: Any[]; calendarSettings: Any; specialDays: Any[]; delays: Any[] }
 interface Store extends Core {
-  units: Any[]; audit: Any[]; seq: Record<string, number>; favorites: Record<string, number[]>; adminPassword?: string;
+  units: Any[]; audit: Any[]; seq: Record<string, number>; favorites: Record<string, number[]>; adminPassword?: string; delayReasons?: boolean;
   undo: { label: string; core: Core }[]; redo: { label: string; core: Core }[];
 }
 
+// the empty copy (built with DEMO_EMPTY=1): the organisation only, no projects or tasks
+const EMPTY = import.meta.env.VITE_DEMO_EMPTY === '1';
 function fresh(): Store {
   const s = clone(seed) as Any;
+  if (EMPTY) { s.projects = []; s.tasks = []; s.deps = []; }
   const max = (l: Any[]) => l.reduce((m, x) => Math.max(m, x.id), 0);
-  return {
+  const st: Store = {
     projects: s.projects, tasks: s.tasks, deps: s.deps, units: s.units.map((u: Any) => ({ ...u, edit_all: false })),
-    calendarSettings: { ...DEFAULT_CALENDAR }, specialDays: [], favorites: {},
+    calendarSettings: { ...DEFAULT_CALENDAR }, specialDays: [], favorites: {}, delays: [],
     audit: [{ id: 1, at: new Date().toISOString(), user_name: 'מערכת', entity: 'plan', action: 'create', summary: 'נטענו נתוני ההדגמה', details: {} }],
-    seq: { project: max(s.projects), task: max(s.tasks), dep: max(s.deps), audit: 1, unit: max(s.units), special: 0 },
+    seq: { project: max(s.projects), task: max(s.tasks), dep: max(s.deps), audit: 1, unit: max(s.units), special: 0, delay: 0 },
     undo: [], redo: [],
   };
+  if (!EMPTY) seedDelays(st);
+  return st;
+}
+
+// The demo plan has an original plan (baseline) for every project, and a few postponements with
+// their reasons (each one also marks the tasks that moved because of it), so every screen has content.
+function seedDelays(st: Store) {
+  const sch = () => computeSchedule(dataOf(st));
+  const s0 = sch();
+  for (const t of st.tasks) { const x = s0.tasks.get(t.id); if (x) { t.baseline_start = x.start; t.baseline_finish = x.finish; } }
+  const list: [string, number, string, string][] = [
+    ['מודול לקוחות', 2, 'staffing', 'שני מפתחים הועברו לטיפול בתקלה דחופה במערכת הקיימת.'],
+    ['רכש ציוד', 3, 'external', 'הספק עיכב את משלוח המתגים, האספקה החלקית הגיעה רק בשבוע הבא.'],
+    ['ממשק למערכת הכספים', 2, 'pricing', 'הערכת המאמץ לא כללה את שינויי ה-API שמערכת הכספים דורשת.'],
+    ['הכנת סביבת תרגול', 2, 'tech_debt', 'סביבת הבדיקות הישנה דרשה שדרוג לפני שאפשר להשתמש בה.'],
+  ];
+  for (const [name, days, reason, description] of list) {
+    const t = st.tasks.find((x) => x.name === name);
+    if (!t) continue;
+    const before = sch();
+    t.duration += days;
+    const after = sch();
+    const at = new Date().toISOString();
+    const row = (task_id: number, from: string, to: string, cause: number | null, desc: string) =>
+      st.delays.push({ id: ++st.seq.delay, at, task_id, unit_id: 1, user_name: 'הנהלת הענף', reason, reason_other: '', description: desc, cause_task_id: cause, from_finish: from, to_finish: to });
+    row(t.id, before.tasks.get(t.id).finish, after.tasks.get(t.id).finish, null, description);
+    for (const m of diffSchedules(before, after, t.id)) {
+      const x = after.tasks.get(m.id);
+      if (x && !x.children?.length && x.baseline_finish && m.to.finish > m.from.finish) row(m.id, m.from.finish, m.to.finish, t.id, '');
+    }
+  }
 }
 let store: Store = (() => {
   try {
@@ -44,6 +78,8 @@ let store: Store = (() => {
         delete st.calendarExceptions;
       }
       st.favorites = st.favorites || {};
+      st.delays = st.delays || [];
+      st.seq.delay = st.seq.delay || st.delays.length;
       st.seq.unit = st.seq.unit || st.units.reduce((m: number, u: Any) => Math.max(m, u.id), 0);
       st.seq.special = st.seq.special || st.specialDays.length;
       return st;
@@ -65,14 +101,17 @@ function currentUser() {
 }
 
 // ---- schedule helpers
-const todayISO = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date());
-const data = () => ({
-  ...store, today: todayISO(),
-  calendarSettings: { ...store.calendarSettings, workDays: DEFAULT_CALENDAR.workDays },
-  calendarExceptions: expandRanges(store.specialDays.filter((r) => r.unit_id == null)),
-});
+function todayISO() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jerusalem' }).format(new Date()); } // hoisted: the seed uses it before this line runs
+function dataOf(st: Store) {
+  return {
+    ...st, today: todayISO(),
+    calendarSettings: { ...st.calendarSettings, workDays: DEFAULT_CALENDAR.workDays },
+    calendarExceptions: expandRanges(st.specialDays.filter((r: Any) => r.unit_id == null)),
+  };
+}
+const data = () => dataOf(store);
 const sched = () => computeSchedule(data());
-const core = (): Core => clone({ projects: store.projects, tasks: store.tasks, deps: store.deps, calendarSettings: store.calendarSettings, specialDays: store.specialDays });
+const core = (): Core => clone({ projects: store.projects, tasks: store.tasks, deps: store.deps, calendarSettings: store.calendarSettings, specialDays: store.specialDays, delays: store.delays });
 const restore = (c: Core) => { Object.assign(store, clone(c)); };
 
 // ---- permissions (same rules as server/src/units.js)
@@ -101,7 +140,21 @@ function mustAssign(user: Any, ownerId: number | null) {
 const needAdmin = (user: Any) => { if (user.role !== 'admin') throw new HttpError(403, 'רק הנהלת הענף יכולה לבצע את הפעולה הזו.'); };
 
 // ---- a change: recompute, refuse cycles, record history and undo
-function mutate(user: Any, fn: (before: Any) => { summary: string; taskId?: number; projectId?: number; action: string; result?: Any }) {
+const DELAY_REASONS: Record<string, string> = {
+  tech_debt: 'חוב טכני', fault: 'תקלה', product: 'מוצרי', staffing: 'אילוצי כוח-אדם',
+  pricing: 'תמחור לקוי', external: 'תלות בגורם חיצוני', other: 'אחר',
+};
+const delayLabel = (r: string, other: string) => (r === 'other' ? (other ? `אחר: ${other}` : 'אחר') : DELAY_REASONS[r] || '');
+function delayOf(d: Any) {
+  if (!d) return null;
+  const reason = String(d.reason || '');
+  if (!(reason in DELAY_REASONS)) throw new HttpError(400, 'צריך לבחור סיבה לדחייה מהרשימה.');
+  const reason_other = String(d.reason_other || '').trim().slice(0, 200);
+  if (reason === 'other' && !reason_other) throw new HttpError(400, 'בסיבה "אחר" צריך לכתוב מה הסיבה.');
+  return { reason, reason_other: reason === 'other' ? reason_other : '', description: String(d.description || '').trim().slice(0, 2000) };
+}
+
+function mutate(user: Any, fn: (before: Any) => { summary: string; taskId?: number; projectId?: number; action: string; result?: Any; delayCheck?: boolean; delay?: Any }) {
   const snapshot = core();
   const before = sched();
   let out;
@@ -110,6 +163,28 @@ function mutate(user: Any, fn: (before: Any) => { summary: string; taskId?: numb
   if (after.cycle) { restore(snapshot); throw new HttpError(400, 'השינוי יוצר תלות מעגלית (משימה שתלויה בעצמה דרך שרשרת), ולכן לא נשמר.'); }
   const moved = diffSchedules(before, after, out.taskId);
   let summary = out.summary;
+  if (store.delayReasons !== false && out.taskId != null) {
+    const id = out.taskId, tb = before.tasks.get(id), ta = after.tasks.get(id);
+    const pid = ta?.project_id;
+    const affects = moved.some((m: Any) => { const x = after.tasks.get(m.id); return x && !x.children?.length && m.to.finish > m.from.finish; })
+      || (pid != null && (after.projects.get(pid)?.finish || '') > (before.projects.get(pid)?.finish || ''));
+    const later = !!(tb && ta && !ta.children?.length && ta.finish > tb.finish && tb.baseline_finish && affects);
+    if (out.delayCheck && later && !out.delay) {
+      const pv = (x: Any) => ({ id: x.id, start: x.start, finish: x.finish, duration: x.duration, work_days: x.work_days });
+      const preview = [pv(ta), ...moved.slice(0, 500).map((m: Any) => pv(after.tasks.get(m.id)))];
+      restore(snapshot);
+      throw new HttpError(409, 'דחיית מועד הסיום דורשת סיבה.', { need_reason: true, task_id: id, name: ta.name, kind: ta.kind, from: tb.finish, to: ta.finish, preview });
+    }
+    const own = later && out.delay ? out.delay : null;
+    const at = new Date().toISOString();
+    const row = (task_id: number, from: string, to: string, cause: number | null, d: Any) =>
+      store.delays.push({ id: ++store.seq.delay, at, task_id, unit_id: user.unit_id ?? null, user_name: user.display_name, reason: d?.reason ?? null, reason_other: d?.reason_other ?? '', description: cause == null ? d?.description ?? '' : '', cause_task_id: cause, from_finish: from, to_finish: to });
+    if (own) { row(id, tb.finish, ta.finish, null, own); summary += ` · סיבת הדחייה: ${delayLabel(own.reason, own.reason_other)}`; }
+    for (const m of moved) {
+      const x = after.tasks.get(m.id);
+      if (x && !x.children?.length && x.baseline_finish && m.to.finish > m.from.finish) row(m.id, m.from.finish, m.to.finish, id, own);
+    }
+  }
   if (moved.length) summary += ` · ${moved.length === 1 ? 'משימה אחת זזה' : `${moved.length} משימות זזו`} בעקבות השינוי`;
   store.audit.unshift({ id: ++store.seq.audit, at: new Date().toISOString(), user_name: user.display_name, entity: 'task', action: out.action, task_id: out.taskId ?? null, project_id: out.projectId ?? null, summary, details: { moved: moved.slice(0, 200) } });
   store.audit = store.audit.slice(0, 500);
@@ -146,6 +221,8 @@ on('POST', /^\/enter$/, (_u, b) => {
 }, 'public');
 on('POST', /^\/logout$/, () => { setUnitId(null); return { ok: true }; }, 'public');
 
+on('GET', /^\/notifications$/, () => ({ items: [], unread: 0, seen: 0 }), 'viewer');
+on('POST', /^\/notifications\/seen$/, () => ({ ok: true }), 'viewer');
 on('GET', /^\/data$/, () => {
   const d = data();
   const s = computeSchedule(d);
@@ -165,8 +242,31 @@ on('GET', /^\/data$/, () => {
     undo: { undo: top(store.undo), redo: top(store.redo) }, units: store.units,
     unitDays: store.specialDays.filter((r) => r.unit_id != null && r.kind !== 'work'),
     favorites: ((store.favorites[String(getUnitId())] || []) as number[]).filter((id) => s.tasks.has(id)),
+    delays: [...new Map(store.delays.map((x) => [x.task_id, x])).values()],
+    delay_reasons: store.delayReasons !== false,
   };
 }, 'viewer');
+
+// every postponement on record, for the "delays" tab of the history page (as the server does it)
+on('GET', /^\/delays$/, () => {
+  const s = sched();
+  return [...store.delays].reverse().filter((r) => s.tasks.has(r.task_id)).map((r) => {
+    const t = s.tasks.get(r.task_id);
+    return {
+      ...r, name: t.name, kind: t.kind, project_id: t.project_id, owner_unit_id: effOwner(s, r.task_id),
+      cause_name: r.cause_task_id != null ? s.tasks.get(r.cause_task_id)?.name || null : null,
+      days: r.from_finish && r.to_finish ? Math.max(0, s.cal.idxOf(toDay(r.to_finish)) - s.cal.idxOf(toDay(r.from_finish))) : null,
+    };
+  });
+}, 'viewer');
+
+on('PUT', /^\/settings\/delay-reasons$/, (user, b) => {
+  needAdmin(user);
+  store.delayReasons = b.on !== false;
+  store.audit.unshift({ id: ++store.seq.audit, at: new Date().toISOString(), user_name: user.display_name, entity: 'settings', action: 'update', summary: store.delayReasons ? 'הופעלה בקשת סיבה לדחיית משימות' : 'כובתה בקשת סיבה לדחיית משימות', details: {} });
+  save();
+  return { ok: true, on: store.delayReasons };
+});
 
 for (const kind of ['undo', 'redo'] as const) {
   on('POST', new RegExp(`^/${kind}$`), (user) => {
@@ -189,7 +289,7 @@ on('POST', /^\/projects$/, (user, b) => {
   needAdmin(user);
   if (!String(b.name || '').trim() || !b.start_date) throw new HttpError(400, 'חסר שם או תאריך התחלה');
   return mutate(user, () => {
-    const p = { id: ++store.seq.project, name: String(b.name).trim(), description: b.description || '', color: b.color || '#3b6fd8', start_date: b.start_date, sort_order: store.projects.length + 1 };
+    const p = { id: ++store.seq.project, name: String(b.name).trim(), description: b.description || '', color: b.color || '#3b6fd8', start_date: b.start_date, sort_order: store.projects.length + 1, target_finish: b.target_finish || null };
     store.projects.push(p);
     return { result: p, action: 'create', projectId: p.id, summary: `נוצר פרויקט "${p.name}"` };
   }).result;
@@ -199,7 +299,7 @@ on('PATCH', /^\/projects\/(\d+)$/, (user, b, m) => {
   const p = store.projects.find((x) => x.id === Number(m[1]));
   if (!p) throw new HttpError(404, 'הפרויקט לא נמצא');
   return mutate(user, () => {
-    for (const k of ['name', 'start_date', 'color', 'description', 'sort_order']) if (k in b) p[k] = b[k];
+    for (const k of ['name', 'start_date', 'color', 'description', 'sort_order', 'target_finish']) if (k in b) p[k] = k === 'target_finish' ? b[k] || null : b[k];
     return { result: p, action: 'update', projectId: p.id, summary: `עודכן פרויקט "${p.name}"` };
   }).result;
 });
@@ -280,7 +380,7 @@ on('PATCH', /^\/tasks\/(\d+)$/, (user, b, m) => {
     if ('deadline' in b) { if (!isDate(b.deadline)) throw new HttpError(400, 'תאריך לא תקין'); set('deadline', b.deadline || null, 'תאריך יעד'); }
     if ('percent' in b && !isSummary) set('percent', Math.max(0, Math.min(100, int(b.percent, t.percent))), 'התקדמות');
     if ('notes' in b) set('notes', String(b.notes ?? ''), 'הערות');
-    return { result: t, action: 'update', taskId: id, projectId: t.project_id, summary: `"${t.name}": ${changes.join(', ') || 'ללא שינוי'}` };
+    return { result: t, action: 'update', taskId: id, projectId: t.project_id, summary: `"${t.name}": ${changes.join(', ') || 'ללא שינוי'}`, delayCheck: true, delay: delayOf(b.delay) };
   });
   return { task: result, moved };
 });
@@ -334,7 +434,6 @@ on('POST', /^\/dependencies$/, (user, b) => {
   const { result, moved } = mutate(user, (before) => {
     const pt = before.tasks.get(p), st = before.tasks.get(s);
     if (!pt || !st) throw new HttpError(404, 'משימה לא נמצאה');
-    mustEdit(user, before, s, 'לקשר אל המשימה הזו (תלות משנה את התאריכים שלה)');
     if (p === s) throw new HttpError(400, 'משימה לא יכולה להיות תלויה בעצמה');
     if (before.ancestors(s).includes(p) || before.ancestors(p).includes(s)) throw new HttpError(400, 'אי אפשר ליצור תלות בין משימה לבין אב-המשימה שלה.');
     if (store.deps.some((d) => (d.predecessor_id === p && d.successor_id === s) || (d.predecessor_id === s && d.successor_id === p))) throw new HttpError(400, 'כבר קיימת תלות בין שתי המשימות האלה');
@@ -348,7 +447,7 @@ on('PATCH', /^\/dependencies\/(\d+)$/, (user, b, m) => {
   const d = store.deps.find((x) => x.id === Number(m[1]));
   if (!d) throw new HttpError(404, 'התלות לא נמצאה');
   const { moved } = mutate(user, (before) => {
-    mustEdit(user, before, d.successor_id, 'לשנות את התלות הזו');
+    try { mustEdit(user, before, d.predecessor_id); } catch { mustEdit(user, before, d.successor_id, 'לשנות את התלות הזו'); }
     if (DEP_TYPES.includes(b.type)) d.type = b.type;
     if ('lag' in b) d.lag = Math.max(-500, Math.min(500, int(b.lag, d.lag)));
     return { action: 'update', taskId: d.successor_id, summary: `עודכנה תלות (${DEP_LABEL[d.type]} ${d.lag})` };
@@ -360,7 +459,7 @@ on('DELETE', /^\/dependencies\/(\d+)$/, (user, _b, m) => {
   const d = store.deps.find((x) => x.id === id);
   if (!d) throw new HttpError(404, 'התלות לא נמצאה');
   const { moved } = mutate(user, (before) => {
-    mustEdit(user, before, d.successor_id, 'להסיר את התלות הזו');
+    try { mustEdit(user, before, d.predecessor_id); } catch { mustEdit(user, before, d.successor_id, 'להסיר את התלות הזו'); }
     store.deps = store.deps.filter((x) => x.id !== id);
     return { action: 'delete', taskId: d.successor_id, summary: 'הוסרה תלות' };
   });
@@ -455,6 +554,14 @@ on('PUT', /^\/admin-password$/, (user, b) => {
   return { ok: true };
 });
 
+on('DELETE', /^\/history$/, (user) => {
+  needAdmin(user);
+  const n = store.audit.length;
+  store.audit = [{ id: ++store.seq.audit, at: new Date().toISOString(), user_name: user.display_name, entity: 'plan', action: 'delete', summary: `כל היסטוריית השינויים נמחקה (${n} רשומות)`, details: {} }];
+  save();
+  return { ok: true, deleted: n };
+});
+
 // import from a file (same rules as server/src/api.js)
 on('POST', /^\/import$/, (user, b) => {
   const rows: Any[] = Array.isArray(b.tasks) ? b.tasks.slice(0, 3000) : [];
@@ -470,7 +577,17 @@ on('POST', /^\/import$/, (user, b) => {
     const proj = store.projects.find((x) => x.id === projectId);
     if (!proj) throw new HttpError(404, 'הפרויקט לא נמצא');
     const idOf = new Map<string, number>();
+    let updated = 0;
     rows.forEach((r, i) => {
+      if (r.update_id != null && !b.new_project) {
+        const t = store.tasks.find((x) => x.id === int(r.update_id, -1));
+        if (!t || t.project_id !== projectId) throw new HttpError(400, 'משימה לעדכון לא נמצאה בפרויקט. כדאי לפתוח את הייבוא מחדש.');
+        if ('start' in r && isDate(r.start) && r.start) t.start_constraint = r.start;
+        if ('duration' in r && t.kind !== 'milestone') t.duration = Math.max(1, int(r.duration, 1));
+        if ('notes' in r) t.notes = String(r.notes || '');
+        updated++;
+        return;
+      }
       const name = String(r.name || '').trim();
       if (!name) return;
       const parentId = r.parent_key != null && idOf.has(String(r.parent_key)) ? idOf.get(String(r.parent_key))! : null;
@@ -487,7 +604,8 @@ on('POST', /^\/import$/, (user, b) => {
       if (pId == null || sId == null || pId === sId || store.deps.some((x) => (x.predecessor_id === pId && x.successor_id === sId) || (x.predecessor_id === sId && x.successor_id === pId))) continue;
       store.deps.push({ id: ++store.seq.dep, predecessor_id: pId, successor_id: sId, type: DEP_TYPES.includes(d.type) ? d.type : 'FS', lag: int(d.lag, 0) }); deps++;
     }
-    return { result: { project_id: projectId, tasks: idOf.size, deps }, action: 'create', projectId: projectId!, summary: `יובאו ${idOf.size} משימות מקובץ אל "${proj.name}"` };
+    const parts = [idOf.size && (idOf.size === 1 ? 'משימה חדשה אחת' : `${idOf.size} משימות חדשות`), updated && (updated === 1 ? 'משימה אחת עודכנה' : `${updated} משימות עודכנו`)].filter(Boolean).join(', ');
+    return { result: { project_id: projectId, tasks: idOf.size, updated, deps }, action: idOf.size ? 'create' : 'update', projectId: projectId!, summary: `ייבוא מקובץ אל "${proj.name}": ${parts || 'בלי שינוי'}` };
   }).result;
 });
 
@@ -562,7 +680,7 @@ export async function demoRequest<T>(method: string, url: string, body?: unknown
     try {
       return clone(h(user, body || {}, match, q)) as T;
     } catch (e) {
-      if (e instanceof HttpError) throw Object.assign(new Error(e.message), { status: e.status });
+      if (e instanceof HttpError) throw Object.assign(new Error(e.message), { status: e.status, info: e.data });
       console.error(e);
       throw Object.assign(new Error('שגיאה בהדגמה'), { status: 500 });
     }

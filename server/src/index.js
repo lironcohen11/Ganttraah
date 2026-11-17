@@ -9,7 +9,7 @@ import { WebSocketServer } from 'ws';
 import { initDb, db } from './db.js';
 import { api } from './api.js';
 import { ensureAdmin, userFromCookieHeader } from './auth.js';
-import { onChange, pruneHistory, HISTORY_DAYS } from './store.js';
+import { onChange, pruneHistory, HISTORY_DAYS, maintenance } from './store.js';
 import { seedDemoIfEmpty } from './seed.js';
 import { ensureUnits, migrateOwners, restructureUnits, migrateSpecialDays } from './units.js';
 
@@ -41,6 +41,17 @@ const prune = () => pruneHistory()
   .catch((e) => console.error('[gantraah] history cleanup failed:', e.message));
 await prune();
 setInterval(prune, 24 * 3600 * 1000).unref();
+// embedded database: housekeeping now, and every night at 03:00 (when nobody works)
+if (db.kind === 'embedded') {
+  await maintenance();
+  const nightly = () => {
+    const now = new Date(), next = new Date(now);
+    next.setHours(3, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    setTimeout(() => { maintenance().finally(nightly); }, next - now).unref();
+  };
+  nightly();
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -75,7 +86,35 @@ const ping = setInterval(() => {
     ws.ping();
   }
 }, 30000);
-wss.on('connection', (ws) => { ws.alive = true; ws.on('pong', () => { ws.alive = true; }); });
+// Who has which task open: every browser tab says which task card it shows ({ type: 'view', task }),
+// and everyone gets the full list after each change ({ type: 'presence', viewers: { taskId: [{ c, n }] } }).
+// c = the tab's own id (so a tab can leave itself out), n = the unit the tab entered as.
+function sendPresence() {
+  const viewers = {};
+  for (const ws of wss.clients) {
+    if (ws.readyState !== 1 || ws.viewing == null) continue;
+    (viewers[ws.viewing] ||= []).push({ c: ws.client || '', n: ws.user?.display_name || '' });
+  }
+  const text = JSON.stringify({ type: 'presence', viewers });
+  for (const ws of wss.clients) if (ws.readyState === 1) ws.send(text);
+}
+wss.on('connection', (ws) => {
+  ws.alive = true;
+  ws.viewing = null;
+  ws.on('pong', () => { ws.alive = true; });
+  ws.on('message', (raw) => {
+    let m;
+    try { m = JSON.parse(String(raw).slice(0, 500)); } catch { return; }
+    if (m?.type !== 'view') return;
+    ws.client = String(m.client || '').slice(0, 40);
+    const task = Number.isInteger(m.task) ? m.task : null;
+    if (task === ws.viewing) return;
+    ws.viewing = task;
+    sendPresence();
+  });
+  ws.on('close', () => { if (ws.viewing != null) sendPresence(); });
+  sendPresence();
+});
 wss.on('close', () => clearInterval(ping));
 onChange((msg) => {
   const text = JSON.stringify(msg);
@@ -86,6 +125,18 @@ server.listen(PORT, HOST, () => {
   console.log(`[gantraah] listening on http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}  (database: ${db.kind})`);
 });
 
-const shutdown = () => { server.close(); process.exit(0); };
+// stopping (Ctrl+C, a service stop, or OpenShift/Kubernetes deleting the pod: SIGTERM): stop taking
+// requests, let the change in progress finish, close the database, then exit. At most 10 seconds.
+let stopping = false;
+const shutdown = async () => {
+  if (stopping) return;
+  stopping = true;
+  console.log('[gantraah] shutting down');
+  setTimeout(() => process.exit(0), 10000).unref();
+  server.close();
+  for (const ws of wss.clients) ws.terminate();
+  try { await db.close(); } catch (e) { console.error('[gantraah] closing the database:', e.message); }
+  process.exit(0);
+};
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

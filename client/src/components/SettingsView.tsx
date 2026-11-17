@@ -275,6 +275,15 @@ function OrgSettings() {
           </div>
         </div>
       </section>
+      <section className="card wide" data-tour="s-delays">
+        <h2>דחיית משימות</h2>
+        <label className="toggle row">
+          <input type="checkbox" checked={model.data.delay_reasons !== false}
+            onChange={(e) => run(() => api.put('/settings/delay-reasons', { on: e.target.checked }), e.target.checked ? 'בקשת הסיבה הופעלה' : 'בקשת הסיבה כובתה')} />
+          לבקש סיבה כשדוחים מועד של משימה שנשמר לה תכנון מקורי
+        </label>
+        <p className="muted small">כשזה כבוי, אפשר לדחות כל משימה בלי לבחור סיבה. סיבות שכבר נרשמו נשארות.</p>
+      </section>
       {pwOpen && <AdminPassword onClose={() => setPwOpen(false)} />}
     </div>
   );

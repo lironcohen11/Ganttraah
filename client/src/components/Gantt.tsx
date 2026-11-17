@@ -1,11 +1,19 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Model, Row } from '../model';
-import { STATUS_LABEL, depText } from '../model';
+import { STATUS_LABEL, depText, doneCount, delayLabel } from '../model';
 import type { Task } from '../types';
 import { toDay, fromDay, fmtDate, fmtDM, fmtMonthYear, fmtMonth, fmtLong, daysText } from '../dates';
 import { Icon } from './Icon';
 
 export type Zoom = 'day' | 'week' | 'month' | 'quarter';
+
+/** Week number: weeks start on Sunday, and week 1 is the week that has 1 January in it. */
+export function weekNo(day: number): number {
+  const wk = (d: number) => Math.floor((d + 4) / 7);
+  const sat = day - (((day + 4) % 7) + 7) % 7 + 6; // the Saturday of this week
+  const y = new Date(sat * 86400000).getUTCFullYear();
+  return wk(day) - wk(Date.UTC(y, 0, 1) / 86400000) + 1;
+}
 export const ZOOMS: { id: Zoom; label: string; px: number }[] = [
   { id: 'day', label: 'ימים', px: 30 },
   { id: 'week', label: 'שבועות', px: 13 },
@@ -20,7 +28,7 @@ const EDIT_COLS: Column[] = [
   { id: 'dur', title: 'משך', width: 60 },
   { id: 'start', title: 'התחלה', width: 78 },
   { id: 'finish', title: 'סיום', width: 78 },
-  { id: 'pct', title: 'התקדמות', width: 74 },
+  { id: 'pct', title: 'הושלם', width: 74 },
   { id: 'owner', title: 'אחראי', width: 112 },
   { id: 'status', title: 'מצב', width: 78 },
 ];
@@ -29,7 +37,7 @@ const PRESENT_COLS: Column[] = [
   { id: 'name', title: 'משימה', width: 320 },
   { id: 'start', title: 'התחלה', width: 86 },
   { id: 'finish', title: 'סיום', width: 86 },
-  { id: 'pct', title: 'התקדמות', width: 84 },
+  { id: 'pct', title: 'הושלם', width: 84 },
   { id: 'status', title: 'מצב', width: 78 },
 ];
 
@@ -64,6 +72,8 @@ interface Props {
   /** width of the task-name column; the divider between the table and the chart changes it */
   nameW?: number;
   onNameW?: (w: number) => void;
+  /** Ctrl + mouse wheel over the chart steps through the zoom levels */
+  onZoom?: (z: Zoom) => void;
 }
 
 const HEAD_H = 52;
@@ -72,6 +82,51 @@ const C = {
   up: 'var(--up)', down: 'var(--down)', crit: 'var(--bad)', arrow: 'var(--g-arrow)', summary: 'var(--g-summary)', ms: 'var(--g-ms)',
   deadline: 'var(--g-deadline)', late: 'var(--bad)', today: 'var(--g-today)', baseline: 'var(--g-baseline)',
 };
+
+/**
+ * Draws only what lies in the visible part of the timeline (plus a margin): one tick and label per
+ * day over years of plan is thousands of elements, and drawing them all made scrolling and zooming
+ * slow. The window moves in steps of CHUNK pixels, so scrolling re-draws this layer only now and
+ * then, and never the rows or the bars.
+ */
+const CHUNK = 1200;
+function XWindow({ scrollRef, target, W, children }: {
+  scrollRef: React.RefObject<HTMLDivElement | null>; target: React.RefObject<SVGSVGElement | null>; W: number;
+  children: (lo: number, hi: number) => React.ReactNode;
+}) {
+  const [win, setWin] = useState<[number, number] | null>(null);
+  const calc = useRef<() => void>(() => {});
+  calc.current = () => {
+    const el = scrollRef.current, svg = target.current;
+    if (!el || !svg) return;
+    const a = el.getBoundingClientRect(), b = svg.getBoundingClientRect();
+    const lo = Math.floor((a.left - b.left) / CHUNK) * CHUNK - CHUNK, hi = Math.ceil((a.right - b.left) / CHUNK) * CHUNK + CHUNK;
+    setWin((w) => (w && w[0] === lo && w[1] === hi ? w : [lo, hi]));
+  };
+  useLayoutEffect(() => { calc.current(); }, [W]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const on = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; calc.current(); }); };
+    el.addEventListener('scroll', on, { passive: true });
+    window.addEventListener('resize', on);
+    return () => { el.removeEventListener('scroll', on); window.removeEventListener('resize', on); cancelAnimationFrame(raf); };
+  }, [scrollRef]);
+  return win ? <>{children(win[0], win[1])}</> : null;
+}
+
+const NARROW = '(max-width: 1199px)';
+function useNarrow() {
+  const [n, setN] = useState(() => matchMedia(NARROW).matches);
+  useEffect(() => {
+    const m = matchMedia(NARROW);
+    const h = () => setN(m.matches);
+    m.addEventListener('change', h);
+    return () => m.removeEventListener('change', h);
+  }, []);
+  return n;
+}
 
 export function Gantt(p: Props) {
   const { model, rows, zoom } = p;
@@ -99,7 +154,12 @@ export function Gantt(p: Props) {
   }, [targetPx]);
   const present = p.mode === 'present';
   const rowH = present ? 40 : 34;
-  const cols = present ? PRESENT_COLS : EDIT_COLS.map((c) => (c.id === 'name' && p.nameW ? { ...c, width: p.nameW } : c));
+  // narrow screens (a 1024 projector, a small laptop): the start date and the progress are already
+  // on the bar itself (where it begins, the % written on it), so those two columns step aside
+  const narrow = useNarrow();
+  const cols = present ? PRESENT_COLS : EDIT_COLS
+    .filter((c) => !(narrow && (c.id === 'start' || c.id === 'pct')))
+    .map((c) => (c.id === 'name' && p.nameW ? { ...c, width: p.nameW } : c));
   const tableW = cols.reduce((s, c) => s + c.width, 0);
   const todayDay = toDay(model.data.today);
 
@@ -121,7 +181,7 @@ export function Gantt(p: Props) {
     const add = (iso?: string | null) => { if (iso) { const d = toDay(iso); lo = Math.min(lo, d); hi = Math.max(hi, d); } };
     for (const r of rows) {
       if (r.type === 'task') { add(r.task.start); add(r.task.finish); add(r.task.deadline); if (p.showBaseline) { add(r.task.baseline_start); add(r.task.baseline_finish); } }
-      else if (r.type === 'project') { add(r.project.start); add(r.project.finish); }
+      else if (r.type === 'project') { add(r.project.start); add(r.project.finish); add(r.project.target_finish); }
     }
     if (p.ghosts) for (const g of p.ghosts.values()) { add(g.start); add(g.finish); }
     const pad = { day: [7, 21], week: [21, 56], month: [45, 120], quarter: [90, 240] }[zoom];
@@ -134,7 +194,7 @@ export function Gantt(p: Props) {
 
   const W = Math.ceil((r1 - r0 + 1) * px);
   const H = Math.max(rows.length * rowH, 1);
-  const HC = H;
+  const HC = Math.max(H, viewH - HEAD_H - 1); // the chart's background reaches the bottom of the view
   const xR = (day: number) => (r1 - day + 1) * px; // right edge of a day = its start (RTL)
   const xL = (day: number) => (r1 - day) * px;     // left edge of a day  = its end
 
@@ -143,6 +203,32 @@ export function Gantt(p: Props) {
     rows.forEach((r, i) => { if (r.type === 'task' && !m.has(r.task.id)) m.set(r.task.id, i); });
     return m;
   }, [rows]);
+
+  // Only the rows on screen are drawn (plus a margin), in the table and in the chart: a plan of
+  // thousands of tasks drew tens of thousands of elements, and scrolling, selecting and zooming
+  // crawled. The window moves in steps of ROW_STEP rows, so scrolling re-draws only now and then.
+  const ROW_STEP = 25, ROW_MARGIN = 30;
+  const [vrows, setVrows] = useState<[number, number]>([0, 120]);
+  const calcRows = useRef<() => void>(() => {});
+  calcRows.current = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const top = Math.max(0, el.scrollTop - HEAD_H) / rowH, n = el.clientHeight / rowH;
+    const a = Math.max(0, Math.floor(top / ROW_STEP) * ROW_STEP - ROW_MARGIN);
+    const b = Math.ceil((top + n) / ROW_STEP) * ROW_STEP + ROW_MARGIN;
+    setVrows((v) => (v[0] === a && v[1] === b ? v : [a, b]));
+  };
+  useLayoutEffect(() => { calcRows.current(); }, [rows.length, rowH, viewH]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const on = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; calcRows.current(); }); };
+    el.addEventListener('scroll', on, { passive: true });
+    return () => { el.removeEventListener('scroll', on); cancelAnimationFrame(raf); };
+  }, []);
+  const [v0, v1] = vrows;
+  const inRows = (i: number) => i >= v0 && i <= v1;
 
   // ---------- scrolling
   const scrollToDay = (day: number) => {
@@ -214,6 +300,66 @@ export function Gantt(p: Props) {
   };
   useLayoutEffect(() => { const el = scrollRef.current, hs = hsRef.current; if (el && hs) hs.scrollLeft = el.scrollLeft; });
 
+  // ---------- grab and drag the chart (or the date scale) sideways: the plan follows the mouse.
+  // A press without movement is still a click (it clears the selection on the chart's background).
+  const panned = useRef(false);
+  const startPan = (e: React.PointerEvent, clickClears: boolean) => {
+    const el = scrollRef.current;
+    if (e.button !== 0 || e.pointerType === 'touch' || drag || !el) return;
+    e.preventDefault(); // no text selection while dragging
+    const x0 = e.clientX, s0 = el.scrollLeft, pid = e.pointerId;
+    let moved = false;
+    panned.current = false;
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid) return;
+      const dx = ev.clientX - x0;
+      if (!moved && Math.abs(dx) < 4) return;
+      if (!moved) { moved = true; panned.current = true; document.body.classList.add('g-panning'); }
+      el.scrollLeft = s0 - dx;
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== pid) return;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      document.body.classList.remove('g-panning');
+      if (!moved && clickClears) p.onSelectRow(null);
+      setTimeout(() => { panned.current = false; }, 0); // the click that ends a drag does nothing
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+  };
+
+  // ---------- Ctrl + wheel over the chart: days ↔ weeks ↔ months ↔ quarters (instead of the browser zoom)
+  const zoomRef = useRef({ zoom, onZoom: p.onZoom });
+  zoomRef.current = { zoom, onZoom: p.onZoom };
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let acc = 0, last = 0, quietUntil = 0;
+    const onWheel = (e: WheelEvent) => {
+      const { zoom: z, onZoom } = zoomRef.current;
+      if (!e.ctrlKey || !onZoom) return;
+      const t = e.target as Node;
+      if (!(svgRef.current?.contains(t) || scaleRef.current?.contains(t))) return; // only over the chart
+      e.preventDefault();
+      const now = performance.now();
+      if (now < quietUntil) return; // the glide to the last level is still running
+      if (now - last > 400) acc = 0;
+      last = now;
+      acc += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+      if (Math.abs(acc) < 60) return; // a touchpad sends many small steps: one level per real flick
+      const i = ZOOMS.findIndex((x) => x.id === z);
+      const j = Math.max(0, Math.min(ZOOMS.length - 1, i + (acc > 0 ? 1 : -1))); // wheel up = closer
+      acc = 0;
+      quietUntil = now + 280;
+      if (j !== i) onZoom(ZOOMS[j].id);
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
   // ---------- divider between the table and the chart
   const startSplit = (e: React.PointerEvent) => {
     if (!p.onNameW) return;
@@ -225,6 +371,21 @@ export function Gantt(p: Props) {
     window.addEventListener('pointermove', mv);
     window.addEventListener('pointerup', up);
   };
+  const selId = p.selectedKey && /^[tx]:/.test(p.selectedKey) ? Number(p.selectedKey.slice(2)) : null;
+  useEffect(() => {
+    const el = scrollRef.current;
+    const t = selId != null ? model.task(selId) : null;
+    if (!el || !t) return;
+    // where the chart part of the view is, in the chart's own x (right of it is the table)
+    const visL = lastScroll.current + (tableW + W) - el.clientWidth;      // left edge of the view
+    const visR = visL + (el.clientWidth - tableW);                         // right edge, where the table starts
+    const barL = xL(toDay(t.finish)) - 40, barR = xR(toDay(t.start)) + 40; // a little room for the label
+    if (barL >= visL && barR <= visR) return;                             // already in view: do not move
+    const startDay = toDay(t.start), mid = Math.round((toDay(t.start) + toDay(t.finish)) / 2);
+    // a long task: bring its start into view; a short one: put it in the middle
+    glideToDay(barR - barL > visR - visL ? startDay - Math.round((visR - visL) / px / 2) + 3 : mid);
+    // eslint-disable-next-line
+  }, [selId]);
   useEffect(() => {
     if (p.revealId == null) return;
     const t = model.task(p.revealId);
@@ -241,7 +402,7 @@ export function Gantt(p: Props) {
   const mayEdit = (id: number) => (p.canEditTask ? p.canEditTask(id) : true);
   type Drag = { mode: 'move' | 'resize' | 'link'; id: number; x0: number; dx: number; x: number; y: number; pid: number };
   const [drag, setDrag] = useState<Drag | null>(null);
-  const [hover, setHover] = useState<{ id: number; cx: number; cy: number } | null>(null);
+  const [hover, setHover] = useState<{ id: number; cx: number; cy: number; base?: boolean } | null>(null);
   const pt = (e: React.PointerEvent) => {
     const r = svgRef.current!.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
@@ -286,7 +447,6 @@ export function Gantt(p: Props) {
     let invalid = '';
     if (model.ancestors(dst).includes(src) || model.ancestors(src).includes(dst)) invalid = 'אי אפשר: אחת נמצאת בתוך השנייה';
     else if (model.data.dependencies.some((x) => (x.predecessor_id === src && x.successor_id === dst) || (x.predecessor_id === dst && x.successor_id === src))) invalid = 'המשימות כבר קשורות';
-    else if (!mayEdit(dst)) invalid = `אין הרשאה: "${r.task.name}" באחריות ${model.ownerName(dst) || 'הנהלת הענף'}`;
     return { task: r.task, row: i, invalid };
   };
   const onMove = (e: React.PointerEvent) => {
@@ -318,7 +478,8 @@ export function Gantt(p: Props) {
   // ---------- header ticks
   const header = useMemo(() => {
     const top: { x1: number; x2: number; label: string }[] = [];
-    const bottom: { x1: number; x2: number; label: string; off?: boolean; hol?: string }[] = [];
+    const bottom: { x1: number; x2: number; label: string; off?: boolean; hol?: string; wk?: number }[] = [];
+    const weeks: { x: number; n: number }[] = [];
     const seg = (a: number, b: number) => ({ x1: xL(b), x2: xR(a) });
     const yearOf = (d: number) => new Date(d * 86400000).getUTCFullYear();
     const monthOf = (d: number) => new Date(d * 86400000).getUTCMonth();
@@ -345,11 +506,15 @@ export function Gantt(p: Props) {
         else if (zoom === 'week') label = fmtDM(fromDay(start));
         else if (zoom === 'month') label = fmtMonth(start);
         else label = `רבעון ${Math.floor(monthOf(start) / 3) + 1}`;
-        bottom.push({ ...s, label, off: zoom === 'day' && !model.cal.isWork(start), hol: zoom === 'day' ? model.cal.label(start) : '' });
+        bottom.push({ ...s, label, off: zoom === 'day' && !model.cal.isWork(start), hol: zoom === 'day' ? model.cal.label(start) : '', wk: zoom === 'week' ? weekNo(start) : undefined });
         start = d;
       }
     }
-    return { top, bottom };
+    // day view: the week number sits in the upper row, at the start (the right edge) of each week
+    if (zoom === 'day') {
+      for (let d = r0; d <= r1; d++) if (((d + 4) % 7 + 7) % 7 === 0) weeks.push({ x: xR(d) - 4, n: weekNo(d) });
+    }
+    return { top, bottom, weeks };
     // eslint-disable-next-line
   }, [r0, r1, zoom, px, model]);
 
@@ -389,7 +554,7 @@ export function Gantt(p: Props) {
   };
 
   const arrows = useMemo(() => {
-    const out: { id: number; d: string; cls: string }[] = [];
+    const out: { id: number; d: string; cls: string; lo: number; hi: number }[] = [];
     for (const dep of model.data.dependencies) {
       const ia = rowOf.get(dep.predecessor_id), ib = rowOf.get(dep.successor_id);
       if (ia == null || ib == null) continue;
@@ -412,7 +577,7 @@ export function Gantt(p: Props) {
         else if (p.highlight.downDeps.has(dep.id)) cls += ' down';
         else cls += ' faded';
       } else if (p.showCritical && a.critical && b.critical) cls += ' crit';
-      out.push({ id: dep.id, d, cls });
+      out.push({ id: dep.id, d, cls, lo: Math.min(ia, ib), hi: Math.max(ia, ib) });
     }
     return out;
     // eslint-disable-next-line
@@ -428,14 +593,15 @@ export function Gantt(p: Props) {
 
   return (
    <div className="gantt-wrap">
-    <div className={`gantt ${present ? 'present' : ''}`} ref={scrollRef} onClick={() => p.onSelectRow(null)} onScroll={onMainScroll}>
+
+    <div className={`gantt ${present ? 'present' : ''}`} ref={scrollRef} onClick={() => { if (!panned.current) p.onSelectRow(null); }} onScroll={onMainScroll}>
       <div className="g-inner" style={{ width: tableW + W }}>
         {/* ---------------- header */}
         <div className="g-head" style={{ height: HEAD_H }}>
           <div className="g-table-head" style={{ width: tableW }}>
             {cols.map((c) => <div key={c.id} className={`cell c-${c.id}`} style={{ width: c.width }}>{c.title}</div>)}
           </div>
-          <svg width={W} height={HEAD_H} className="g-scale" ref={scaleRef}>
+          <svg width={W} height={HEAD_H} className="g-scale" ref={scaleRef} onPointerDown={(e) => startPan(e, false)}>
             {header.top.map((s, i) => (
               <g key={'t' + i}>
                 <line x1={s.x1} x2={s.x1} y1={0} y2={HEAD_H / 2} className="tick" />
@@ -443,15 +609,29 @@ export function Gantt(p: Props) {
               </g>
             ))}
             <line x1={0} x2={W} y1={HEAD_H / 2} y2={HEAD_H / 2} className="tick" />
-            {header.bottom.map((s, i) => (
-              <g key={'b' + i}>
+            <XWindow scrollRef={scrollRef} target={scaleRef} W={W}>{(lo, hi) => (<>
+            {header.weeks.filter((w) => w.x >= lo && w.x <= hi && !header.top.some((s) => s.x2 - s.x1 > 60 && Math.abs(w.x - 22 - (s.x1 + s.x2) / 2) < 70)
+                && Math.abs(w.x - 22 - (xR(todayDay) - px / 2)) > 40).map((w) => (
+              <text key={'w' + w.n + '-' + w.x} x={w.x - 22} y={17} className="scale-wk"><title>{`שבוע ${w.n}`}</title>ש׳{w.n}</text>
+            ))}
+            {header.bottom.filter((s) => s.x2 >= lo && s.x1 <= hi).map((s) => (
+              <g key={'b' + s.x1}>
                 {s.off && <rect x={s.x1} y={HEAD_H / 2} width={s.x2 - s.x1} height={HEAD_H / 2} className={s.hol ? 'hol-head' : 'off-head'} />}
                 <line x1={s.x1} x2={s.x1} y1={HEAD_H / 2} y2={HEAD_H} className="tick" />
-                <text x={(s.x1 + s.x2) / 2} y={HEAD_H - 9} className={`scale-bottom ${s.off ? 'off' : ''}`}>{s.x2 - s.x1 >= 14 ? s.label : ''}</text>
+                {s.wk != null && s.x2 - s.x1 >= 70 ? (
+                  <>
+                    <text x={s.x2 - 17} y={HEAD_H - 9} className="scale-wk">ש׳{s.wk}</text>
+                    <text x={(s.x1 + s.x2) / 2 - 10} y={HEAD_H - 9} className="scale-bottom">{s.label}</text>
+                    <title>{`שבוע ${s.wk} · מתחיל ב-${s.label}`}</title>
+                  </>
+                ) : (
+                  <text x={(s.x1 + s.x2) / 2} y={HEAD_H - 9} className={`scale-bottom ${s.off ? 'off' : ''}`}>{s.x2 - s.x1 >= 14 ? s.label : ''}</text>
+                )}
                 {s.hol && <circle cx={(s.x1 + s.x2) / 2} cy={HEAD_H / 2 + 4} r={2.5} className="hol-dot"><title>{s.hol}</title></circle>}
                 {s.hol && <title>{s.hol}</title>}
               </g>
             ))}
+            </>)}</XWindow>
             <g>
               <rect x={xR(todayDay) - px / 2 - 16} y={HEAD_H / 2 - 9} width={32} height={15} rx={7} fill={C.today} />
               <text x={xR(todayDay) - px / 2} y={HEAD_H / 2 + 2} className="today-label">היום</text>
@@ -462,7 +642,8 @@ export function Gantt(p: Props) {
         {/* ---------------- body */}
         <div className="g-body" style={{ height: HC }}>
           <div className="g-table" style={{ width: tableW, height: HC }}>
-            {rows.map((r, i) => (
+            {v0 > 0 && <div style={{ height: v0 * rowH }} aria-hidden="true" />}
+            {rows.slice(v0, v1 + 1).map((r, k) => { const i = v0 + k; return (
               <GridRow key={r.key + i} row={r} cols={cols} rowH={rowH} model={model} present={present}
                 selected={p.selectedKey === r.key}
                 dim={r.type === 'task' && dimmed(r.task.id)}
@@ -479,13 +660,13 @@ export function Gantt(p: Props) {
                 blocked={r.type === 'task' && !!p.blocked?.has(r.task.id)}
                 ghost={r.type === 'task' ? p.ghosts?.get(r.task.id) : undefined}
               />
-            ))}
+            ); })}
           </div>
 
           <svg ref={svgRef} width={W} height={HC} className="g-chart"
             onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={() => setDrag(null)}
             onClick={(e) => e.stopPropagation()}
-            onPointerDown={(e) => { if (e.target === svgRef.current) p.onSelectRow(null); }}>
+            onPointerDown={(e) => startPan(e, e.target === svgRef.current)}>
             <defs>
               {(['arrow', 'up', 'down', 'crit', 'faded'] as const).map((k) => (
                 <marker key={k} id={`ah-${k}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -504,24 +685,26 @@ export function Gantt(p: Props) {
             </defs>
 
             {/* background: rows, non-working days, today */}
-            {rows.map((r, i) => (
+            {rows.map((r, i) => inRows(i) && (
               <rect key={'bg' + i} x={0} y={i * rowH} width={W} height={rowH}
                 className={`row-bg ${p.selectedKey === r.key ? 'sel' : ''} ${r.type === 'project' ? 'proj' : ''} ${r.type === 'group' ? 'grp' : ''}`} />
             ))}
-            {offDays.map((o) => (
+            <XWindow scrollRef={scrollRef} target={svgRef} W={W}>{(lo, hi) => (<>
+            {offDays.filter((o) => { const x = xL(o.d); return x + px >= lo && x <= hi; }).map((o) => (
               <rect key={'off' + o.d} x={xL(o.d)} y={0} width={px} height={HC} className={o.hol ? 'hol-col' : 'off-col'}>
                 {o.hol && <title>{o.hol}</title>}
               </rect>
             ))}
-            {unitOff.map((o) => (
+            {unitOff.filter((o) => { const x = xL(o.d); return inRows(o.i) && x + px >= lo && x <= hi; }).map((o) => (
               <rect key={`uo${o.i}-${o.d}`} x={xL(o.d)} y={o.i * rowH} width={px} height={rowH} className="unit-off"><title>{o.label}</title></rect>
             ))}
+            </>)}</XWindow>
             {header.top.map((s, i) => <line key={'ml' + i} x1={s.x1} x2={s.x1} y1={0} y2={HC} className="month-line" />)}
             <line x1={xR(todayDay) - px / 2} x2={xR(todayDay) - px / 2} y1={0} y2={HC} className="today-line" />
 
             {/* dependency arrows */}
             <g className="arrows">
-              {arrows.map((a) => (
+              {arrows.filter((a) => a.lo <= v1 && a.hi >= v0).map((a) => (
                 <path key={a.id} d={a.d} className={a.cls}
                   markerEnd={`url(#ah-${a.cls.includes('up') ? 'up' : a.cls.includes('down') ? 'down' : a.cls.includes('crit') ? 'crit' : a.cls.includes('faded') ? 'faded' : 'arrow'})`} />
               ))}
@@ -529,7 +712,7 @@ export function Gantt(p: Props) {
 
             {/* bars */}
             {rows.map((r, i) => {
-              if (r.type === 'group') return null;
+              if (r.type === 'group' || (!inRows(i) && drag?.id !== (r.type === 'task' ? r.task.id : -1))) return null;
               if (r.type === 'project') {
                 const pr = r.project;
                 if (!pr.roots.length) return null;
@@ -544,7 +727,19 @@ export function Gantt(p: Props) {
                     <rect x={right - (w * pr.percent) / 100} y={y - h / 2} width={(w * pr.percent) / 100} height={h} fill={pr.color} />
                     <rect x={left} y={y - h / 2} width={3} height={h + 5} fill={pr.color} />
                     <rect x={right - 3} y={y - h / 2} width={3} height={h + 5} fill={pr.color} />
-                    <text x={left - 8} y={y + 4} className="bar-label strong">{pr.percent}%</text>
+                    <text x={left - 8} y={y + 4} className="bar-label strong">{(() => { const c = doneCount(model, pr.roots); return `${c.done}/${c.total}`; })()}</text>
+                    {pr.target_finish && (() => {
+                      // the estimated finish: a small flag at the end of that day
+                      const tx = xL(toDay(pr.target_finish));
+                      const c = pr.target_missed ? C.late : C.deadline;
+                      return (
+                        <g className="target-flag">
+                          <line x1={tx} x2={tx} y1={y - 13} y2={y + 11} stroke={c} strokeWidth="2" />
+                          <path d={`M${tx},${y - 13}h-11l3,4.5l-3,4.5h11z`} fill={c} />
+                          <title>{`סיום משוער: ${fmtLong(pr.target_finish)}${pr.target_missed ? ` · לפי התוכנית הפרויקט מסתיים מאוחר יותר (${fmtLong(pr.finish)})` : ''}`}</title>
+                        </g>
+                      );
+                    })()}
                   </g>
                 );
               }
@@ -561,6 +756,12 @@ export function Gantt(p: Props) {
               const w = Math.max(2, right - left);
               const bh = present ? 22 : 18;
               const by = g.cy - bh / 2;
+              // free slack: from the finish to the latest finish that moves nothing else. Shown as a band
+              // on the selected task and on the one being dragged (the rest of the chart stays clean)
+              const ff = !present && t.kind !== 'summary' && t.free_float != null && t.free_until ? t.free_float : 0;
+              const slackL = ff > 0 ? xL(toDay(t.free_until!)) : g.left;
+              const showSlack = ff > 0 && (isDrag || sel);
+              const pastLimit = isDrag && drag!.mode !== 'link' && t.free_until != null && left < xL(toDay(t.free_until)) - 1;
               const ghost = p.ghosts?.get(t.id);
               const isBlocked = p.blocked?.has(t.id);
               const label = present
@@ -576,6 +777,19 @@ export function Gantt(p: Props) {
                   {showBase && (t.kind === 'milestone'
                     ? <path d={diamond(xL(toDay(t.baseline_finish!)), g.cy + 9, 4)} fill={C.baseline} />
                     : <rect x={xL(toDay(t.baseline_finish!))} y={g.cy + bh / 2 + 2} width={xR(toDay(t.baseline_start!)) - xL(toDay(t.baseline_finish!))} height={4} rx={2} fill={C.baseline} />)}
+                  {showBase && (
+                    // a wider invisible strip over the grey line: hovering it explains the gap (and why it was postponed)
+                    <rect className="base-hit" x={xL(toDay(t.baseline_finish!)) - (t.kind === 'milestone' ? 6 : 0)} y={g.cy + bh / 2 - 1}
+                      width={Math.max(12, xR(toDay(t.baseline_start!)) - xL(toDay(t.baseline_finish!)))} height={10} fill="transparent"
+                      onPointerEnter={(e) => { e.stopPropagation(); setHover({ id: t.id, cx: e.clientX, cy: e.clientY, base: true }); }}
+                      onPointerMove={(e) => { e.stopPropagation(); if (!drag) setHover({ id: t.id, cx: e.clientX, cy: e.clientY, base: true }); }}
+                      onPointerLeave={() => setHover(null)} />
+                  )}
+
+                  {showSlack && <rect x={slackL} y={g.y + 3} width={g.left - slackL} height={rowH - 6} rx={4} className="slack-band" pointerEvents="none" />}
+                  {isDrag && drag!.mode !== 'link' && t.free_until && (
+                    <line x1={xL(toDay(t.free_until))} x2={xL(toDay(t.free_until))} y1={g.y - 6} y2={g.y + rowH + 6} className={`slack-limit ${pastLimit ? 'past' : ''}`} pointerEvents="none" />
+                  )}
 
                   {ghost && (t.kind === 'milestone'
                     ? <path d={diamond(xL(toDay(ghost.finish)), g.cy, 8)} className="ghost" />
@@ -590,18 +804,18 @@ export function Gantt(p: Props) {
                     <g onPointerDown={(e) => startDrag(e, 'move', r)}>
                       {(hl || sel) && <circle cx={left} cy={g.cy} r={13} className={`hl-box ${sel ? 'sel' : hl}`} />}
                       <path d={diamond(left, g.cy, present ? 9 : 8)} fill={isBlocked ? 'url(#hatch)' : p.showCritical && t.critical ? C.crit : t.percent >= 100 ? C.ms : 'var(--surface)'}
-                        stroke={p.showCritical && t.critical ? C.crit : C.ms} strokeWidth={2} />
+                        stroke={pastLimit ? C.late : p.showCritical && t.critical ? C.crit : C.ms} strokeWidth={2} />
                     </g>
                   ) : (
                     <g>
                       {(hl || sel) && <rect x={left - 3} y={by - 3} width={w + 6} height={bh + 6} rx={6} className={`hl-box ${sel ? 'sel' : hl}`} />}
-                      <rect x={left} y={by} width={w} height={bh} rx={4} fill={isBlocked ? 'url(#hatch)' : color} fillOpacity={isBlocked ? 1 : 0.22} stroke={color} strokeWidth={1.2}
+                      <rect x={left} y={by} width={w} height={bh} rx={4} fill={isBlocked ? 'url(#hatch)' : pastLimit ? C.late : color} fillOpacity={isBlocked ? 1 : 0.22} stroke={pastLimit ? C.late : color} strokeWidth={pastLimit ? 2 : 1.2}
                         className={p.editable && !r.external && mayEdit(t.id) ? 'draggable' : ''} onPointerDown={(e) => startDrag(e, 'move', r)} />
                       {t.percent > 0 && !isBlocked && (
                         <rect x={right - (w * t.percent) / 100} y={by} width={(w * t.percent) / 100} height={bh} rx={4} fill={color}
                           pointerEvents="none" />
                       )}
-                      {!present && w > 34 && <text x={right - 6} y={g.cy + 4} className={`bar-pct ${t.percent >= 50 ? 'on' : ''}`} pointerEvents="none">{t.percent}%</text>}
+                      {!present && w > 22 && t.percent >= 100 && <text x={right - 6} y={g.cy + 4} className="bar-pct on" pointerEvents="none">✓</text>}
                       {p.editable && !r.external && mayEdit(t.id) && (
                         <rect x={left - 3} y={by} width={7} height={bh} className="resize-h" onPointerDown={(e) => startDrag(e, 'resize', r)} />
                       )}
@@ -659,8 +873,8 @@ export function Gantt(p: Props) {
         </div>
       </div>
 
-      {hoverTask && !drag && <Tooltip t={hoverTask} model={model} x={hover!.cx} y={hover!.cy} showOwner={!present || p.showOwners} />}
-      {!rows.length && <div className="g-empty">אין משימות להצגה</div>}
+      {hoverTask && !drag && <Tooltip t={hoverTask} model={model} x={hover!.cx} y={hover!.cy} showOwner={!present || p.showOwners} base={hover!.base} />}
+      {!rows.length && <div className="g-empty">{model.projectList.length ? 'אין משימות להצגה. אולי הסינון מסתיר אותן: "אחראים" או "מועדפים".' : 'עוד אין פרויקטים. הנהלת הענף יוצרת פרויקט מ"יצירה" › "פרויקט", או מייבאת תוכנית מתפריט "קובץ".'}</div>}
     </div>
     {p.onNameW && <div className="g-split" style={{ right: tableW - 4 }} onPointerDown={startSplit} title="גרירה משנה את רוחב הטבלה" />}
     <div className="g-hscroll" ref={hsRef} onScroll={onBarScroll} style={{ width: Math.max(0, viewW - tableW), marginInlineEnd: sbW }}>
@@ -684,7 +898,7 @@ function Bracket({ left, right, y, h, color }: { left: number; right: number; y:
   );
 }
 
-function Tooltip({ t, model, x, y, showOwner }: { t: Task; model: Model; x: number; y: number; showOwner: boolean }) {
+function Tooltip({ t, model, x, y, showOwner, base }: { t: Task; model: Model; x: number; y: number; showOwner: boolean; base?: boolean }) {
   const rel = model.relations(t.id);
   const style: React.CSSProperties = { top: y + 16, left: Math.max(8, x - 300) };
   return (
@@ -694,11 +908,27 @@ function Tooltip({ t, model, x, y, showOwner }: { t: Task; model: Model; x: numb
       <div className="tip-grid">
         <span>תאריכים</span><b>{fmtDate(t.start)}{t.kind !== 'milestone' && ` – ${fmtDate(t.finish)}`}</b>
         {t.kind !== 'milestone' && <><span>משך</span><b>{daysText(t.work_days)} עבודה</b></>}
-        <span>התקדמות</span><b>{t.percent}% · {STATUS_LABEL[t.status]}</b>
+        {t.kind !== 'summary' && t.free_float != null && t.free_until && <><span>מרווח</span><b>{t.free_float > 0 ? `אפשר לדחות עד ${fmtDate(t.free_until)} בלי להשפיע` : 'אין: דחייה תזיז משימות אחרות'}</b></>}
+        <span>מצב</span><b>{t.kind === 'summary' ? (() => { const c = doneCount(model, [t.id]); return `הושלמו ${c.done} מתוך ${c.total} · ${STATUS_LABEL[t.status]}`; })() : STATUS_LABEL[t.status]}</b>
         {showOwner && model.ownerName(t.id) && <><span>אחראי</span><b>{model.ownerName(t.id)}</b></>}
         {t.deadline && <><span>תאריך יעד</span><b className={t.deadline_missed ? 'bad' : ''}>{fmtDate(t.deadline)}{t.deadline_missed ? ' · חריגה' : ''}</b></>}
         {t.baseline_finish && t.baseline_finish !== t.finish && <><span>סיום מקורי</span><b>{fmtDate(t.baseline_finish)}</b></>}
       </div>
+      {base && (() => {
+        // only over the grey original-plan line: why the task is later than planned
+        const d = model.delays.get(t.id);
+        if (!d) return null;
+        const cause = d.cause_task_id != null ? model.task(d.cause_task_id) : null;
+        return (
+          <div className="tip-delay">
+            <div className="tip-delay-head"><Icon name="calendar" size={12} /> נדחתה ב-<bdi>{fmtDate(d.at.slice(0, 10))}</bdi>{d.from_finish && d.to_finish ? <>: הסיום זז מ-<bdi>{fmtDate(d.from_finish)}</bdi> ל-<bdi>{fmtDate(d.to_finish)}</bdi></> : null}</div>
+            {d.cause_task_id != null
+              ? <div>בעקבות דחייה של <b>"{cause?.name || 'משימה שנמחקה'}"</b>{d.reason ? ` (${delayLabel(d.reason, d.reason_other)})` : ''}</div>
+              : <div><b>סיבה: {delayLabel(d.reason, d.reason_other)}</b></div>}
+            {d.description && <div className="tip-delay-desc">{d.description}</div>}
+          </div>
+        );
+      })()}
       {(rel.drivers.length > 0 || rel.driven.length > 0) && (
         <div className="tip-rel">
           {rel.drivers.length > 0 && <div><span className="dot up" />תלויה ב-{rel.drivers.length === 1 ? `"${model.task(rel.drivers[0].other)?.name}" (${depText(rel.drivers[0].dep.type, rel.drivers[0].dep.lag)})` : `${rel.drivers.length} משימות`}</div>}
@@ -733,13 +963,17 @@ function GridRow(g: GridRowProps) {
           <div className="name-wrap" style={{ paddingInlineStart: indent }}>
             {Array.from({ length: r.depth }).map((_, k) => <span key={k} className="guide" style={{ insetInlineStart: k * 18 + 9 }} />)}
             {hasKids && !(t && r.type === 'task' && r.external)
-              ? <button className={`tog ${g.collapsed ? 'closed' : ''}`} onClick={(e) => { e.stopPropagation(); g.onToggle(); }} aria-label={g.collapsed ? 'פתח' : 'סגור'}><Icon name="chevronDown" size={14} /></button>
+              ? <button className={`tog ${r.type === 'project' ? 'proj' : ''} ${g.collapsed ? 'closed' : ''}`} onClick={(e) => { e.stopPropagation(); g.onToggle(); }}
+                  onDoubleClick={(e) => e.stopPropagation() /* quick clicks on the arrow only open and close, never open the editing */}
+                  aria-label={g.collapsed ? 'פתח' : 'סגור'} title={g.collapsed ? 'פתיחה: הצגת מה שבתוך' : 'סגירה'}>
+                  <Icon name="chevronDown" size={r.type === 'project' ? 16 : 14} strokeWidth={2.8} />
+                </button>
               : <span className="tog-sp" />}
             {r.type === 'project' && <span className="proj-chip" style={{ background: pr.color }} />}
             {t?.kind === 'milestone' && <Icon name="diamond" size={12} className="ms-icon" />}
             {g.renaming && t ? (
               <input className="rename" autoFocus defaultValue={t.name}
-                onClick={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
                 onKeyDown={(e) => { if (e.key === 'Enter') g.onRename((e.target as HTMLInputElement).value.trim()); if (e.key === 'Escape') g.onRename(t.name); }}
                 onBlur={(e) => g.onRename(e.target.value.trim())} />
             ) : (
@@ -758,8 +992,10 @@ function GridRow(g: GridRowProps) {
       case 'start': return fmtDate(t ? t.start : pr.roots.length ? pr.start : null);
       case 'finish': return fmtDate(t ? t.finish : pr.roots.length ? pr.finish : null);
       case 'pct': {
-        const v = t ? t.percent : pr.percent;
-        return <div className="pct"><div className="pct-bar"><i style={{ width: `${v}%`, background: pr.color }} /></div><span>{v}%</span></div>;
+        // a task: done or not. A phase or project: how many of its tasks are done
+        if (t && !t.children.length) return t.percent >= 100 ? <span className="done-mark" title={t.kind === 'milestone' ? 'הושגה' : 'הושלמה'}><Icon name="check" size={14} /></span> : <span className="muted">—</span>;
+        const c = doneCount(model, t ? [t.id] : pr.roots);
+        return <div className="pct" title={`הושלמו ${c.done} מתוך ${c.total} משימות`}><div className="pct-bar"><i style={{ width: `${c.total ? (c.done / c.total) * 100 : 0}%`, background: pr.color }} /></div><span>{c.done}/{c.total}</span></div>;
       }
       case 'owner': {
         if (!t) return '';
@@ -773,6 +1009,7 @@ function GridRow(g: GridRowProps) {
           const late = pr.late_count + pr.deadline_issues, behind = pr.behind_count;
           if (pr.percent >= 100) return <span className="st-tag done">הושלם</span>;
           if (late) return <span className="st-tag late" title={`${late} משימות באיחור או בחריגה מתאריך יעד`}>באיחור</span>;
+          if (pr.target_missed) return <span className="st-tag late over" title={`התוכנית מסתיימת ב-${fmtDate(pr.finish)}, אחרי הסיום המשוער (${fmtDate(pr.target_finish)})`}>חורג מהיעד</span>;
           if (behind) return <span className="st-tag behind" title={`${behind} משימות בפיגור`}>בפיגור</span>;
           return <span className="st-tag active">תקין</span>;
         }
@@ -805,11 +1042,12 @@ export function Legend({ showBaseline, showCritical }: { showBaseline: boolean; 
       {row(<svg width="30" height="14"><path d="M1,2H29V9H26V13H23V9H7V13H4V9H1Z" fill={C.summary} /></svg>, 'אב-משימה: מתפרסת על כל מה שבתוכה')}
       {row(<svg width="30" height="14"><g opacity=".3"><path d="M1,2H29V13H26V8H4V13H1Z" fill="#3b6fd8" /></g><rect x="15" y="2" width="14" height="6" fill="#3b6fd8" /></svg>, 'פרויקט: בהיר = כל הפרויקט, מלא = מה שהושלם')}
       {row(<svg width="16" height="16"><path d={diamond(8, 8, 6)} fill="var(--surface)" stroke={C.ms} strokeWidth="2" /></svg>, 'אבן דרך (מלאה = הושגה)')}
+      {row(<svg width="30" height="12"><rect x="1" y="1" width="28" height="10" rx="3" className="slack-band" /></svg>, 'מרווח של המשימה הנבחרת: עד מתי אפשר לדחות אותה בלי להזיז משימות אחרות')}
       {showBaseline && row(<svg width="30" height="8"><rect x="1" y="2" width="28" height="4" rx="2" fill={C.baseline} /></svg>, 'התכנון המקורי (תכנון מול ביצוע)')}
       {showCritical && row(<svg width="30" height="12"><rect x="1" y="1" width="28" height="10" rx="3" fill={C.crit} /></svg>, 'נתיב קריטי: עיכוב בה מזיז את סיום הפרויקט')}
       <div className="lg-title">סימונים</div>
-      {row(<svg width="12" height="10"><path d="M1,1h10l-5,7z" fill={C.deadline} /></svg>, 'תאריך יעד')}
       {row(<svg width="12" height="10"><path d="M1,1h10l-5,7z" fill={C.late} /></svg>, 'חריגה מתאריך היעד')}
+      {row(<svg width="14" height="14"><line x1="12" x2="12" y1="1" y2="13" stroke={C.deadline} strokeWidth="2" /><path d="M12,1h-10l3,4l-3,4h10z" fill={C.deadline} /></svg>, 'סיום משוער של פרויקט (אדום: התוכנית עוברת אותו)')}
       {row(<svg width="30" height="12"><path d="M1,6H12V10H26" fill="none" stroke={C.arrow} strokeWidth="1.3" /><path d="M24,7L29,10L24,13z" fill={C.arrow} /></svg>, 'תלות: המשימה שמשמאל מחכה לזו שמימין')}
       {row(<svg width="30" height="12"><rect x="2" y="1" width="12" height="10" rx="3" fill="none" stroke={C.up} strokeWidth="2" /><rect x="17" y="1" width="12" height="10" rx="3" fill="none" stroke={C.down} strokeWidth="2" /></svg>, 'בהצגת התלויות: כתום משפיעה, סגול מושפעת')}
       {row(<svg width="4" height="14"><rect width="2" height="14" fill={C.today} /></svg>, 'היום')}

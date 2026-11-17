@@ -135,3 +135,69 @@ ALTER TABLE units ADD COLUMN IF NOT EXISTS edit_all BOOLEAN NOT NULL DEFAULT FAL
 
 -- 1.5.1: when the original plan (baseline) of a project was last saved
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS baseline_at TIMESTAMPTZ;
+
+-- 1.5.1: the estimated finish date of a project (a target to compare the plan with)
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS target_finish DATE;
+
+-- 1.5.1: updates (the bell): a dependency was added, changed or removed on a unit's task
+CREATE TABLE IF NOT EXISTS notifications (
+  id            SERIAL PRIMARY KEY,
+  at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  unit_id       INT NOT NULL REFERENCES units(id) ON DELETE CASCADE,  -- the unit whose task it is
+  actor_unit_id INT,
+  actor_name    TEXT NOT NULL DEFAULT '',
+  kind          TEXT NOT NULL,          -- dep_add | dep_edit | dep_del
+  task_id       INT,                    -- the unit's own task in this dependency
+  pred_id       INT, succ_id INT,
+  pred_name     TEXT NOT NULL DEFAULT '', succ_name TEXT NOT NULL DEFAULT '',
+  detail        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS notifications_unit_idx ON notifications(unit_id, id);
+-- the last update each unit has seen
+CREATE TABLE IF NOT EXISTS notification_seen (
+  unit_id INT PRIMARY KEY REFERENCES units(id) ON DELETE CASCADE,
+  last_id INT NOT NULL DEFAULT 0
+);
+
+-- why tasks were postponed: a row each time a task's finish moved later. A direct postponement
+-- needs a reason (chosen from a fixed list); tasks that moved because a task they depend on was
+-- postponed get a row too, pointing at that task (cause_task_id) and carrying its reason.
+-- No foreign key on task_id: undo re-creates the tasks. rev = the change that wrote the row (undo removes it).
+CREATE TABLE IF NOT EXISTS task_delays (
+  id            SERIAL PRIMARY KEY,
+  at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  rev           INT NOT NULL DEFAULT 0,
+  task_id       INT NOT NULL,
+  unit_id       INT,
+  user_name     TEXT NOT NULL DEFAULT '',
+  reason        TEXT,                    -- tech_debt | fault | product | staffing | pricing | external | other | null (moved by another change)
+  reason_other  TEXT NOT NULL DEFAULT '',
+  description   TEXT NOT NULL DEFAULT '',
+  cause_task_id INT,
+  from_finish   DATE,
+  to_finish     DATE
+);
+CREATE INDEX IF NOT EXISTS task_delays_task_idx ON task_delays(task_id, id);
+CREATE INDEX IF NOT EXISTS task_delays_reason_idx ON task_delays(reason);
+
+-- 1.8: the task pool (backlog): tasks that have no date yet. Kept apart from the plan: not scheduled,
+-- not in the Gantt, the manager view or exports, until they are placed in a project with a date
+-- (then they become ordinary tasks and leave the pool).
+CREATE TABLE IF NOT EXISTS backlog (
+  id            SERIAL PRIMARY KEY,
+  name          TEXT NOT NULL,
+  notes         TEXT NOT NULL DEFAULT '',
+  project_id    INT REFERENCES projects(id) ON DELETE SET NULL,  -- where it is expected to go (optional)
+  owner_unit_id INT REFERENCES units(id) ON DELETE SET NULL,
+  duration      INT,                                              -- estimated work days (optional)
+  sort_order    INT NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 1.8: updates in the bell are read one by one (clicking one), or all at once ("read all", notification_seen)
+CREATE TABLE IF NOT EXISTS notification_reads (
+  unit_id  INT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+  notif_id INT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  PRIMARY KEY (unit_id, notif_id)
+);

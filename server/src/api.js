@@ -1,6 +1,7 @@
+import { gzipSync } from 'node:zlib';
 import express from 'express';
 import { db, isoDate } from './db.js';
-import { HttpError, mutate, loadAll, currentSchedule, audit, broadcast, undoState, undoRedo, HISTORY_DAYS } from './store.js';
+import { HttpError, mutate, loadAll, currentSchedule, audit, broadcast, undoState, undoRedo, HISTORY_DAYS, DELAY_REASONS } from './store.js';
 import { computeSchedule, DEP_TYPES } from './scheduler.js';
 import { toDay, fromDay, holidaysInRange, DEFAULT_CALENDAR } from './calendar.js';
 import { impactGraph, simulate, taskPath } from './impact.js';
@@ -10,6 +11,8 @@ import { loadUnits, isWithin, effectiveOwner, canEditTask, kindAtDepth, unitDept
 export const api = express.Router();
 api.use(express.json({ limit: '1mb' }));
 api.use(authenticate);
+// the browser tab that sent the request: changes carry it, so each tab knows which changes came from others
+api.use((req, _res, next) => { if (req.user) req.user.client = String(req.get('x-client') || '').slice(0, 40); next(); });
 
 const viewer = requireRole('viewer');
 const editor = requireRole('editor');
@@ -17,8 +20,8 @@ const admin = requireRole('admin');
 
 const FIELD_LABELS = {
   name: 'שם', kind: 'סוג', duration: 'משך', start_constraint: 'התחלה מתוכננת', percent: 'התקדמות',
-  owner: 'אחראי', notes: 'הערות', deadline: 'תאריך יעד', cost: 'עלות',
-  start_date: 'תאריך התחלה', color: 'צבע', description: 'תיאור',
+  owner: 'שם האחראי', notes: 'הערות', deadline: 'תאריך יעד', cost: 'עלות',
+  start_date: 'תאריך התחלה', color: 'צבע', description: 'תיאור', target_finish: 'סיום משוער',
 };
 const KIND_LABEL = { task: 'משימה', milestone: 'אבן דרך' };
 const DEP_LABEL = { FS: 'סיום ← התחלה', SS: 'התחלה ← התחלה', FF: 'סיום ← סיום' };
@@ -143,6 +146,49 @@ api.delete('/units/:id', admin, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ------------------------------------------------------------------ updates (the bell)
+async function notifScope(req) {
+  if (!req.user.unit_id || req.user.role === 'admin') return null;
+  return [...unitSubtree(await loadUnits(), req.user.unit_id)];
+}
+async function unreadCount(req) {
+  const scope = await notifScope(req);
+  if (!scope) return 0;
+  const seen = (await db.query('SELECT last_id FROM notification_seen WHERE unit_id=$1', [req.user.unit_id]))[0]?.last_id ?? 0;
+  return (await db.query(`SELECT count(*)::int AS n FROM notifications n WHERE n.unit_id = ANY($1::int[]) AND n.id > $2 AND (n.actor_unit_id IS NULL OR n.actor_unit_id <> $3)
+    AND NOT EXISTS (SELECT 1 FROM notification_reads r WHERE r.unit_id = $3 AND r.notif_id = n.id)`,
+    [scope, seen, req.user.unit_id]))[0].n;
+}
+api.get('/notifications', viewer, async (req, res) => {
+  const scope = await notifScope(req);
+  if (!scope) return res.json({ items: [], unread: 0, seen: 0 });
+  const seen = (await db.query('SELECT last_id FROM notification_seen WHERE unit_id=$1', [req.user.unit_id]))[0]?.last_id ?? 0;
+  const rows = await db.query(`SELECT n.*, EXISTS (SELECT 1 FROM notification_reads r WHERE r.unit_id = $2 AND r.notif_id = n.id) AS was_read
+    FROM notifications n WHERE n.unit_id = ANY($1::int[]) AND (n.actor_unit_id IS NULL OR n.actor_unit_id <> $2) ORDER BY n.id DESC LIMIT 60`, [scope, req.user.unit_id]);
+  const items = rows.map(({ was_read, ...n }) => ({ ...n, read: n.id <= seen || !!was_read }));
+  res.json({ items, unread: items.filter((n) => !n.read).length, seen });
+});
+api.post('/notifications/seen', viewer, async (req, res) => {
+  if (!req.user.unit_id) return res.json({ ok: true });
+  const last = intOr(req.body?.last_id, 0);
+  await db.query(`INSERT INTO notification_seen (unit_id, last_id) VALUES ($1,$2) ON CONFLICT (unit_id) DO UPDATE SET last_id = GREATEST(notification_seen.last_id, EXCLUDED.last_id)`, [req.user.unit_id, last]);
+  res.json({ ok: true });
+});
+
+// one update read (clicked); "read all" is /notifications/seen with the newest id
+api.post('/notifications/:id/read', viewer, async (req, res) => {
+  if (!req.user.unit_id) return res.json({ ok: true });
+  await db.query('INSERT INTO notification_reads (unit_id, notif_id) SELECT $1, id FROM notifications WHERE id=$2 ON CONFLICT DO NOTHING', [req.user.unit_id, idParam(req)]);
+  res.json({ ok: true });
+});
+api.post('/notifications/read-all', viewer, async (req, res) => {
+  if (!req.user.unit_id) return res.json({ ok: true });
+  const last = (await db.query('SELECT coalesce(max(id),0)::int AS n FROM notifications'))[0].n;
+  await db.query(`INSERT INTO notification_seen (unit_id, last_id) VALUES ($1,$2) ON CONFLICT (unit_id) DO UPDATE SET last_id = GREATEST(notification_seen.last_id, EXCLUDED.last_id)`, [req.user.unit_id, last]);
+  await db.query('DELETE FROM notification_reads WHERE unit_id=$1 AND notif_id <= $2', [req.user.unit_id, last]);
+  res.json({ ok: true });
+});
+
 // ------------------------------------------------------------------ favourites (kept per unit)
 api.post('/favorites', editor, async (req, res) => {
   const taskId = intOr(req.body?.task_id, null);
@@ -160,6 +206,90 @@ const mustEdit = (req, units, sched, taskId, what = 'לערוך את המשימ�
     throw new HttpError(403, `אין לך הרשאה ${what}${name ? `: היא באחריות "${name}"` : ': רק הנהלת הענף יכולה'}.`);
   }
 };
+/** a dependency may be changed by whoever may edit one of its two tasks */
+const mustEditOne = (req, units, sched, d, what) => {
+  if (canEditTask(req.user, units, sched, d.predecessor_id) || canEditTask(req.user, units, sched, d.successor_id)) return;
+  mustEdit(req, units, sched, d.successor_id, what);
+};
+
+/**
+ * Updates for the bell: tell the units that own the two tasks of a dependency that it changed.
+ * One row per unit (when both tasks are the same unit's, one row). The unit that made the
+ * change is not told about its own change.
+ */
+async function notifyDep(req, sched, kind, d, detail = '') {
+  try {
+    const pt = sched.tasks.get(d.predecessor_id), st = sched.tasks.get(d.successor_id);
+    const rows = new Map();
+    for (const [tid] of [[d.successor_id], [d.predecessor_id]]) {
+      const u = effectiveOwner(sched, tid);
+      if (u == null || u === req.user.unit_id || rows.has(u)) continue;
+      rows.set(u, tid);
+    }
+    for (const [unit, tid] of rows) {
+      await db.query(`INSERT INTO notifications (unit_id, actor_unit_id, actor_name, kind, task_id, pred_id, succ_id, pred_name, succ_name, detail)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [unit, req.user.unit_id ?? null, req.user.display_name, kind, tid, d.predecessor_id, d.successor_id, pt?.name || '', st?.name || '', detail]);
+    }
+    if (rows.size) broadcast({ type: 'notify', units: [...rows.keys()] });
+  } catch (e) { console.error('[notify]', e.message); }
+}
+
+/**
+ * Updates for the bell: a task was handed to a unit (a new task, or an existing one whose owner
+ * changed). Not sent when a unit takes a task for itself.
+ * kind: assign_new | assign | assign_many (an import: one row per unit, detail = how many)
+ */
+async function notifyAssign(req, items) {
+  try {
+    const sent = new Set();
+    for (const { unit, kind, task_id = null, name = '', detail = '' } of items) {
+      if (unit == null || unit === req.user.unit_id) continue;
+      await db.query(`INSERT INTO notifications (unit_id, actor_unit_id, actor_name, kind, task_id, succ_id, succ_name, detail)
+        VALUES ($1,$2,$3,$4,$5,$5,$6,$7)`, [unit, req.user.unit_id ?? null, req.user.display_name, kind, task_id, name, String(detail)]);
+      sent.add(unit);
+    }
+    if (sent.size) broadcast({ type: 'notify', units: [...sent] });
+  } catch (e) { console.error('[notify]', e.message); }
+}
+/**
+ * Updates for the bell: tasks were deleted (a task with its sub-tasks, or a whole project). Every
+ * task outside the deleted ones that depended on one of them, or that one of them depended on,
+ * loses that dependency: tell the unit that owns it. Collected before the delete (inside the
+ * change), sent after it. Not sent to the unit that deleted.
+ */
+async function lostDeps(tx, sched, deletedIds) {
+  const gone = new Set(deletedIds);
+  if (!gone.size) return [];
+  const deps = await tx.query('SELECT * FROM dependencies WHERE predecessor_id = ANY($1::int[]) OR successor_id = ANY($1::int[])', [[...gone]]);
+  const out = [];
+  for (const d of deps) {
+    const keep = gone.has(d.predecessor_id) ? d.successor_id : d.predecessor_id;
+    if (gone.has(keep)) continue; // both sides deleted
+    const pt = sched.tasks.get(d.predecessor_id), st = sched.tasks.get(d.successor_id);
+    const del = gone.has(d.predecessor_id) ? pt : st;
+    out.push({ unit: effectiveOwner(sched, keep), task_id: keep, pred_id: d.predecessor_id, succ_id: d.successor_id,
+      pred_name: pt?.name || '', succ_name: st?.name || '', project_id: del?.project_id });
+  }
+  return out;
+}
+async function notifyLostDeps(req, rows) {
+  try {
+    const sent = new Set();
+    const pname = new Map();
+    for (const r of rows) {
+      if (r.unit == null || r.unit === req.user.unit_id) continue;
+      if (!pname.has(r.project_id)) pname.set(r.project_id, r.project_name ?? await projectName(r.project_id));
+      await db.query(`INSERT INTO notifications (unit_id, actor_unit_id, actor_name, kind, task_id, pred_id, succ_id, pred_name, succ_name, detail)
+        VALUES ($1,$2,$3,'task_del',$4,$5,$6,$7,$8,$9)`,
+        [r.unit, req.user.unit_id ?? null, req.user.display_name, r.task_id, r.pred_id, r.succ_id, r.pred_name, r.succ_name, pname.get(r.project_id) || '']);
+      sent.add(r.unit);
+    }
+    if (sent.size) broadcast({ type: 'notify', units: [...sent] });
+  } catch (e) { console.error('[notify]', e.message); }
+}
+const projectName = async (id) => (await db.query('SELECT name FROM projects WHERE id=$1', [id]))[0]?.name || '';
+
 /** owner chosen by a non-admin must be their own unit or below it */
 const mustAssign = (req, units, ownerId) => {
   if (req.user.role === 'admin') return;
@@ -170,7 +300,25 @@ const mustAssign = (req, units, ownerId) => {
 
 // ------------------------------------------------------------------ everything the UI needs
 api.get('/data', viewer, async (req, res) => {
-  const { data, sched } = await currentSchedule();
+  const cur = await currentSchedule();
+  if (!cur.extra.dataJson) cur.extra.dataJson = dataJson(cur);
+  const personal = {
+    undo: await undoState(req.user),
+    units: await loadUnits(),
+    notif_unread: await unreadCount(req),
+    favorites: req.user.unit_id ? (await db.query('SELECT task_id FROM favorites WHERE unit_id=$1', [req.user.unit_id])).map((r) => r.task_id).filter((id) => cur.sched.tasks.has(id)) : [],
+  };
+  const body = cur.extra.dataJson.slice(0, -1) + ',' + JSON.stringify(personal).slice(1);
+  res.type('application/json');
+  // every change makes every open screen load this again: compressed it is about a tenth of the size
+  if (body.length > 20000 && /gzip/.test(req.headers['accept-encoding'] || '')) {
+    res.set('Content-Encoding', 'gzip').set('Vary', 'Accept-Encoding');
+    return res.send(gzipSync(body, { level: 1 }));
+  }
+  res.send(body);
+});
+/** the part of /data that is the same for everyone, as JSON (made once per change) */
+function dataJson({ data, sched }) {
   const tasks = [...sched.tasks.values()];
   let lo = toDay(data.today) - 60, hi = toDay(data.today) + 400;
   for (const t of tasks) { lo = Math.min(lo, toDay(t.start) - 60); hi = Math.max(hi, toDay(t.finish) + 400); }
@@ -181,7 +329,7 @@ api.get('/data', viewer, async (req, res) => {
     const ruleWork = data.calendarSettings.workDays.includes(wd);
     if (info.label || info.work !== ruleWork) days.push({ d: fromDay(d), off: !info.work, label: info.label });
   }
-  res.json({
+  return JSON.stringify({
     today: data.today,
     projects: [...sched.projects.values()],
     tasks: tasks.map(({ _ES, _EF, ...t }) => t),
@@ -189,12 +337,12 @@ api.get('/data', viewer, async (req, res) => {
     calendar: { workDays: data.calendarSettings.workDays, days },
     cycle: sched.cycle,
     db: db.kind,
-    undo: await undoState(req.user),
-    units: await loadUnits(),
     unitDays: data.specialDays.filter((r) => r.unit_id != null && r.kind !== 'work'),
-    favorites: req.user.unit_id ? (await db.query('SELECT task_id FROM favorites WHERE unit_id=$1', [req.user.unit_id])).map((r) => r.task_id).filter((id) => sched.tasks.has(id)) : [],
+    delays: data.delays,
+    delay_reasons: data.delayReasons,
+    backlog: data.backlog,
   });
-});
+}
 
 // ------------------------------------------------------------------ undo / redo
 api.post('/undo', editor, async (req, res) => res.json(await undoRedo(req.user, 'undo')));
@@ -202,14 +350,16 @@ api.post('/redo', editor, async (req, res) => res.json(await undoRedo(req.user, 
 
 // ------------------------------------------------------------------ projects
 api.post('/projects', admin, async (req, res) => {
-  const { name, start_date, color, description } = req.body || {};
+  const { name, start_date, color, description, target_finish } = req.body || {};
   if (!String(name || '').trim()) throw new HttpError(400, 'חסר שם פרויקט');
   if (!start_date || !isDate(start_date)) throw new HttpError(400, 'חסר תאריך התחלה');
+  if (!isDate(target_finish)) throw new HttpError(400, 'תאריך הסיום המשוער לא תקין');
+  if (target_finish && target_finish < start_date) throw new HttpError(400, 'הסיום המשוער לפני תאריך ההתחלה');
   const { result } = await mutate(req.user, async (tx) => {
     const so = (await tx.query('SELECT coalesce(max(sort_order),0)+1 AS n FROM projects'))[0].n;
     const p = (await tx.query(
-      'INSERT INTO projects (name, start_date, color, description, sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [String(name).trim(), start_date, color || '#3b6fd8', description || '', so]))[0];
+      'INSERT INTO projects (name, start_date, color, description, sort_order, target_finish) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [String(name).trim(), start_date, color || '#3b6fd8', description || '', so, target_finish || null]))[0];
     return { result: p, audit: { entity: 'project', entity_id: p.id, project_id: p.id, action: 'create', summary: `נוצר פרויקט "${p.name}"` } };
   });
   res.json(result);
@@ -223,10 +373,19 @@ api.patch('/projects/:id', admin, async (req, res) => {
     if (!p) throw new HttpError(404, 'הפרויקט לא נמצא');
     const changes = [];
     const sets = [], vals = [];
-    for (const k of ['name', 'start_date', 'color', 'description', 'sort_order']) {
+    for (const k of ['name', 'start_date', 'color', 'description', 'sort_order', 'target_finish']) {
       if (!(k in body)) continue;
       let v = body[k];
       if (k === 'start_date' && (!v || !isDate(v))) throw new HttpError(400, 'תאריך לא תקין');
+      if (k === 'target_finish') {
+        if (!isDate(v)) throw new HttpError(400, 'תאריך לא תקין');
+        v = v || null;
+        if (v && v < (body.start_date || isoDate(p.start_date))) throw new HttpError(400, 'הסיום המשוער לפני תאריך ההתחלה');
+        if (isoDate(p.target_finish) === v) continue;
+        vals.push(v); sets.push(`${k}=$${vals.length}`);
+        changes.push(`${FIELD_LABELS[k]}: ${isoDate(p.target_finish) || '—'} → ${v || '—'}`);
+        continue;
+      }
       if (k === 'name' && !String(v).trim()) throw new HttpError(400, 'חסר שם');
       if (k === 'sort_order') v = intOr(v, p.sort_order);
       vals.push(v); sets.push(`${k}=$${vals.length}`);
@@ -242,12 +401,16 @@ api.patch('/projects/:id', admin, async (req, res) => {
 
 api.delete('/projects/:id', admin, async (req, res) => {
   const id = idParam(req);
-  await mutate(req.user, async (tx) => {
+  let lost = [];
+  await mutate(req.user, async (tx, before) => {
     const p = (await tx.query('SELECT * FROM projects WHERE id=$1', [id]))[0];
     if (!p) throw new HttpError(404, 'הפרויקט לא נמצא');
+    lost = await lostDeps(tx, before, [...before.tasks.values()].filter((t) => t.project_id === id).map((t) => t.id));
+    lost.forEach((r) => { r.project_name = p.name; });
     await tx.query('DELETE FROM projects WHERE id=$1', [id]);
     return { audit: { entity: 'project', entity_id: id, project_id: id, action: 'delete', summary: `נמחק פרויקט "${p.name}"` } };
   });
+  await notifyLostDeps(req, lost);
   res.json({ ok: true });
 });
 
@@ -313,7 +476,7 @@ api.post('/tasks', editor, async (req, res) => {
         : await tx.query('SELECT coalesce(max(sort_order),0)+10 AS n FROM tasks WHERE parent_id=$1', [parentId]);
       sort = r[0].n;
     }
-    const duration = kind === 'milestone' ? 0 : Math.max(1, intOr(b.duration, 5));
+    const duration = kind === 'milestone' ? 0 : Math.max(1, Math.min(5000, intOr(b.duration, 5))); // same limit as editing
     const t = (await tx.query(
       `INSERT INTO tasks (project_id, parent_id, sort_order, name, kind, duration, start_constraint, owner, owner_unit_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
@@ -321,6 +484,7 @@ api.post('/tasks', editor, async (req, res) => {
     await renumber(tx, projectId, parentId);
     return { result: t, audit: { entity: 'task', entity_id: t.id, project_id: projectId, task_id: t.id, action: 'create', summary: `נוצרה ${KIND_LABEL[kind]} "${name}"` } };
   });
+  await notifyAssign(req, [{ unit: result.owner_unit_id, kind: 'assign_new', task_id: result.id, name: result.name, detail: await projectName(projectId) }]);
   res.json(result);
 });
 
@@ -328,6 +492,7 @@ api.patch('/tasks/:id', editor, async (req, res) => {
   const id = idParam(req);
   const b = req.body || {};
   const units = await loadUnits();
+  let handed = null;
   const { result, moved } = await mutate(req.user, async (tx, before) => {
     const t = (await tx.query('SELECT * FROM tasks WHERE id=$1', [id]))[0];
     if (!t) throw new HttpError(404, 'המשימה לא נמצאה');
@@ -363,6 +528,7 @@ api.patch('/tasks/:id', editor, async (req, res) => {
       if (old === v || (old == null && v == null)) continue;
       vals.push(v); sets.push(`${k}=$${vals.length}`);
       const unitName = (x) => (x == null ? 'ללא' : units.find((u) => u.id === x)?.name || x);
+      if (k === 'owner') continue; // the person's name lives only in the task card: not in the history or anywhere else
       if (k === 'notes') changes.push('הערות עודכנו');
       else if (k === 'owner_unit_id') changes.push(`אחראי: ${unitName(old)} → ${unitName(v)}`);
       else changes.push(`${FIELD_LABELS[k]}: ${showVal(k, old)} → ${showVal(k, v)}`);
@@ -370,11 +536,18 @@ api.patch('/tasks/:id', editor, async (req, res) => {
     if (!sets.length) return { result: t };
     vals.push(id);
     const nt = (await tx.query(`UPDATE tasks SET ${sets.join(',')}, updated_at=now() WHERE id=$${vals.length} RETURNING *`, vals))[0];
+    if ('owner_unit_id' in next && (t.owner_unit_id ?? null) !== (nt.owner_unit_id ?? null)) handed = nt;
+    // only the person's name changed: saved, and nothing else (no history line, no notice to others)
+    if (!changes.length) return { result: nt };
+    const { owner: _personName, ...shown } = next;
     return {
       result: nt,
-      audit: { entity: 'task', entity_id: id, project_id: t.project_id, task_id: id, action: 'update', summary: `"${nt.name}": ${changes.join(', ')}`, details: { changes: next } },
+      audit: { entity: 'task', entity_id: id, project_id: t.project_id, task_id: id, action: 'update', summary: `"${nt.name}": ${changes.join(', ')}`, details: { changes: shown } },
+      // a change that postpones the task's finish must say why (checked once the new dates are known)
+      delayCheck: true, delay: delayOf(b.delay),
     };
   });
+  if (handed) await notifyAssign(req, [{ unit: handed.owner_unit_id, kind: 'assign', task_id: handed.id, name: handed.name, detail: await projectName(handed.project_id) }]);
   res.json({ task: result, moved });
 });
 
@@ -430,16 +603,169 @@ function subtreeIds(s, id) {
 api.delete('/tasks/:id', editor, async (req, res) => {
   const id = idParam(req);
   const units = await loadUnits();
+  let lost = [];
   await mutate(req.user, async (tx, before) => {
     const t = before.tasks.get(id);
     if (!t) throw new HttpError(404, 'המשימה לא נמצאה');
     mustEdit(req, units, before, id, 'למחוק את המשימה הזו');
     const n = subtreeIds(before, id).size;
+    lost = await lostDeps(tx, before, [...subtreeIds(before, id)]);
     await tx.query('DELETE FROM tasks WHERE id=$1', [id]);
     await renumber(tx, t.project_id, t.parent_id ?? null);
     return { audit: { entity: 'task', entity_id: id, project_id: t.project_id, task_id: id, action: 'delete', summary: `נמחקה "${t.name}"${n > 1 ? ` יחד עם ${n - 1} תתי-משימות` : ''}`, details: { task: t } } };
   });
+  await notifyLostDeps(req, lost);
   res.json({ ok: true });
+});
+
+// ------------------------------------------------------------------ task pool (backlog)
+// Tasks that have no date yet. They are kept apart from the plan: nothing schedules them, and they
+// are not in the Gantt. Placing one in the Gantt turns it into an ordinary task and takes it out of
+// the pool. Every change goes through mutate(), so it is in the history and can be undone.
+// Who may change an item: like a task. Its owner unit or a unit above it, a unit that may edit the
+// whole plan, and branch management. An item with no owner: only branch management.
+const canEditPool = (user, units, item) => {
+  if (user.role === 'admin' || (user.role === 'editor' && user.edit_all)) return true;
+  return user.role === 'editor' && !!user.unit_id && isWithin(units, item.owner_unit_id ?? null, user.unit_id);
+};
+const mustEditPool = (req, units, item, what = 'לשנות את הפריט הזה') => {
+  if (canEditPool(req.user, units, item)) return;
+  const name = units.find((u) => u.id === item.owner_unit_id)?.name;
+  throw new HttpError(403, `אין לך הרשאה ${what}${name ? `: הוא באחריות "${name}"` : ': רק הנהלת הענף יכולה'}.`);
+};
+const poolDuration = (v) => (v == null || v === '' ? null : Math.max(1, Math.min(5000, intOr(v, 1))));
+
+api.post('/backlog', editor, async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 500);
+  if (!name) throw new HttpError(400, 'חסר שם');
+  const units = await loadUnits();
+  let ownerUnit = b.owner_unit_id == null || b.owner_unit_id === '' ? null : intOr(b.owner_unit_id, null);
+  if (ownerUnit == null && req.user.role !== 'admin') ownerUnit = req.user.unit_id;
+  if (ownerUnit != null || req.user.role !== 'admin') mustAssign(req, units, ownerUnit);
+  const { result } = await mutate(req.user, async (tx) => {
+    const projectId = b.project_id == null || b.project_id === '' ? null : intOr(b.project_id, null);
+    if (projectId != null && !(await tx.query('SELECT 1 FROM projects WHERE id=$1', [projectId])).length) throw new HttpError(400, 'הפרויקט לא נמצא');
+    const so = (await tx.query('SELECT coalesce(max(sort_order),0)+10 AS n FROM backlog'))[0].n;
+    const item = (await tx.query(
+      `INSERT INTO backlog (name, notes, project_id, owner_unit_id, duration, sort_order) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [name, String(b.notes ?? '').slice(0, 20000), projectId, ownerUnit, poolDuration(b.duration), so]))[0];
+    return { result: item, audit: { entity: 'backlog', entity_id: item.id, project_id: projectId, action: 'create', summary: `נוסף למאגר המשימות: "${name}"` } };
+  });
+  res.json(result);
+});
+
+api.patch('/backlog/:id', editor, async (req, res) => {
+  const id = idParam(req);
+  const b = req.body || {};
+  const units = await loadUnits();
+  const { result } = await mutate(req.user, async (tx) => {
+    const item = (await tx.query('SELECT * FROM backlog WHERE id=$1', [id]))[0];
+    if (!item) throw new HttpError(404, 'הפריט לא נמצא במאגר');
+    mustEditPool(req, units, item);
+    const next = {};
+    if ('name' in b) { const v = String(b.name || '').trim().slice(0, 500); if (!v) throw new HttpError(400, 'חסר שם'); next.name = v; }
+    if ('notes' in b) next.notes = String(b.notes ?? '').slice(0, 20000);
+    if ('duration' in b) next.duration = poolDuration(b.duration);
+    if ('project_id' in b) {
+      const v = b.project_id == null || b.project_id === '' ? null : intOr(b.project_id, null);
+      if (v != null && !(await tx.query('SELECT 1 FROM projects WHERE id=$1', [v])).length) throw new HttpError(400, 'הפרויקט לא נמצא');
+      next.project_id = v;
+    }
+    if ('owner_unit_id' in b) {
+      const v = b.owner_unit_id == null || b.owner_unit_id === '' ? null : intOr(b.owner_unit_id, null);
+      if (v != null && !units.some((u) => u.id === v)) throw new HttpError(400, 'יחידה לא קיימת');
+      mustAssign(req, units, v);
+      next.owner_unit_id = v;
+    }
+    const sets = [], vals = [], changes = [];
+    const unitName = (x) => (x == null ? 'ללא' : units.find((u) => u.id === x)?.name || x);
+    for (const [k, v] of Object.entries(next)) {
+      if ((item[k] ?? null) === v) continue;
+      vals.push(v); sets.push(`${k}=$${vals.length}`);
+      if (k === 'notes') changes.push('הערות עודכנו');
+      else if (k === 'owner_unit_id') changes.push(`אחראי: ${unitName(item[k])} → ${unitName(v)}`);
+      else if (k === 'project_id') changes.push('פרויקט עודכן');
+      else if (k === 'duration') changes.push(`משך משוער: ${item[k] ? `${item[k]} ימים` : '—'} → ${v ? `${v} ימים` : '—'}`);
+      else changes.push(`שם: ${item.name} → ${v}`);
+    }
+    if (!sets.length) return { result: item };
+    vals.push(id);
+    const ni = (await tx.query(`UPDATE backlog SET ${sets.join(',')}, updated_at=now() WHERE id=$${vals.length} RETURNING *`, vals))[0];
+    return { result: ni, audit: { entity: 'backlog', entity_id: id, project_id: ni.project_id, action: 'update', summary: `מאגר המשימות, "${ni.name}": ${changes.join(', ')}` } };
+  });
+  res.json(result);
+});
+
+api.delete('/backlog/:id', editor, async (req, res) => {
+  const id = idParam(req);
+  const units = await loadUnits();
+  await mutate(req.user, async (tx) => {
+    const item = (await tx.query('SELECT * FROM backlog WHERE id=$1', [id]))[0];
+    if (!item) throw new HttpError(404, 'הפריט לא נמצא במאגר');
+    mustEditPool(req, units, item, 'למחוק את הפריט הזה');
+    await tx.query('DELETE FROM backlog WHERE id=$1', [id]);
+    return { audit: { entity: 'backlog', entity_id: id, project_id: item.project_id, action: 'delete', summary: `נמחק ממאגר המשימות: "${item.name}"`, details: { item } } };
+  });
+  res.json({ ok: true });
+});
+
+/** send a task back to the pool: it leaves the Gantt (no dates), its dependencies go, and it waits in Backlog */
+api.post('/tasks/:id/to-backlog', editor, async (req, res) => {
+  const id = idParam(req);
+  const units = await loadUnits();
+  let lost = [];
+  const { result } = await mutate(req.user, async (tx, before) => {
+    const t = before.tasks.get(id);
+    if (!t) throw new HttpError(404, 'המשימה לא נמצאה');
+    mustEdit(req, units, before, id, 'להעביר את המשימה הזו ל-Backlog');
+    if (t.children.length) throw new HttpError(400, 'אפשר להעביר ל-Backlog רק משימה בלי תתי-משימות.');
+    lost = await lostDeps(tx, before, [id]);
+    const so = (await tx.query('SELECT coalesce(max(sort_order),0)+10 AS n FROM backlog'))[0].n;
+    const owner = t.owner_unit_id ?? effectiveOwner(before, id);
+    const item = (await tx.query(
+      `INSERT INTO backlog (name, notes, project_id, owner_unit_id, duration, sort_order) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [t.name, t.notes || '', t.project_id, owner, t.kind === 'milestone' ? null : Math.max(1, t.duration | 0), so]))[0];
+    await tx.query('DELETE FROM tasks WHERE id=$1', [id]);
+    await renumber(tx, t.project_id, t.parent_id ?? null);
+    return { result: item, audit: { entity: 'task', entity_id: id, project_id: t.project_id, task_id: id, action: 'delete', summary: `"${t.name}" הועברה ל-Backlog (בלי תאריכים)`, details: { task: t } } };
+  });
+  await notifyLostDeps(req, lost);
+  res.json(result);
+});
+
+/** place a pool item in the Gantt: it becomes a task in a project (under a parent task if one is chosen), with a start date */
+api.post('/backlog/:id/schedule', editor, async (req, res) => {
+  const id = idParam(req);
+  const b = req.body || {};
+  const units = await loadUnits();
+  const projectId = intOr(b.project_id, null);
+  if (!projectId) throw new HttpError(400, 'צריך לבחור פרויקט');
+  if (!b.start || !isDate(b.start)) throw new HttpError(400, 'צריך לבחור תאריך התחלה');
+  const { result } = await mutate(req.user, async (tx) => {
+    const item = (await tx.query('SELECT * FROM backlog WHERE id=$1', [id]))[0];
+    if (!item) throw new HttpError(404, 'הפריט לא נמצא במאגר');
+    mustEditPool(req, units, item, 'לשבץ את הפריט הזה');
+    const p = (await tx.query('SELECT * FROM projects WHERE id=$1', [projectId]))[0];
+    if (!p) throw new HttpError(404, 'הפרויקט לא נמצא');
+    const parentId = b.parent_id == null || b.parent_id === '' ? null : intOr(b.parent_id, null);
+    if (parentId != null) {
+      const par = (await tx.query('SELECT * FROM tasks WHERE id=$1', [parentId]))[0];
+      if (!par || par.project_id !== projectId) throw new HttpError(400, 'אב-משימה לא תקינה');
+    }
+    const r = parentId == null
+      ? await tx.query('SELECT coalesce(max(sort_order),0)+10 AS n FROM tasks WHERE project_id=$1 AND parent_id IS NULL', [projectId])
+      : await tx.query('SELECT coalesce(max(sort_order),0)+10 AS n FROM tasks WHERE parent_id=$1', [parentId]);
+    const duration = Math.max(1, Math.min(5000, intOr(b.duration, item.duration || 5)));
+    const t = (await tx.query(
+      `INSERT INTO tasks (project_id, parent_id, sort_order, name, kind, duration, start_constraint, owner, owner_unit_id, notes)
+       VALUES ($1,$2,$3,$4,'task',$5,$6,'',$7,$8) RETURNING *`,
+      [projectId, parentId, r[0].n, item.name, duration, b.start, item.owner_unit_id ?? null, item.notes || '']))[0];
+    await renumber(tx, projectId, parentId);
+    await tx.query('DELETE FROM backlog WHERE id=$1', [id]);
+    return { result: t, audit: { entity: 'task', entity_id: t.id, project_id: projectId, task_id: t.id, action: 'create', summary: `"${item.name}" שובצה בגאנט ממאגר המשימות (${p.name})` } };
+  });
+  res.json(result);
 });
 
 // ------------------------------------------------------------------ import (from Excel / CSV, mapped in the browser)
@@ -462,7 +788,7 @@ api.post('/import', editor, async (req, res) => {
     return o;
   };
   const owners = rows.map(ownerOf);
-  const { result } = await mutate(req.user, async (tx) => {
+  const { result } = await mutate(req.user, async (tx, before) => {
     let projectId = intOr(b.project_id, null), pname;
     if (b.new_project) {
       const np = b.new_project;
@@ -479,8 +805,29 @@ api.post('/import', editor, async (req, res) => {
     const idOf = new Map();
     const base = (await tx.query('SELECT coalesce(max(sort_order),0) AS n FROM tasks WHERE project_id=$1 AND parent_id IS NULL', [projectId]))[0].n;
     const order = new Map(); // sort order per parent
+    let added = 0; // rows actually added (a repeated key still adds its row)
+    let updated = 0;
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
+      // a row of a file imported before: it updates that task (same project, same owner, a plain
+      // task), and only what the file gives: start, duration, description. Progress stays.
+      if (r.update_id != null && !b.new_project) {
+        const id = intOr(r.update_id, null), cur = before.tasks.get(id);
+        if (!cur || cur.project_id !== projectId || cur.children.length) throw new HttpError(400, 'משימה לעדכון לא נמצאה בפרויקט. כדאי לפתוח את הייבוא מחדש.');
+        if (effectiveOwner(before, id) !== owners[i]) throw new HttpError(400, `המשימה "${cur.name}" באחריות צוות אחר, ולכן לא עודכנה.`);
+        mustEdit(req, units, before, id);
+        const sets = [], vals = [];
+        if ('start' in r && isDate(r.start) && r.start) { vals.push(r.start); sets.push(`start_constraint=$${vals.length}`); }
+        if ('duration' in r && cur.kind !== 'milestone') { vals.push(Math.max(1, Math.min(5000, intOr(r.duration, 1)))); sets.push(`duration=$${vals.length}`); }
+        if ('notes' in r) { vals.push(String(r.notes || '').slice(0, 20000)); sets.push(`notes=$${vals.length}`); }
+        if (sets.length) {
+          vals.push(id);
+          await tx.query(`UPDATE tasks SET ${sets.join(', ')}, updated_at=now() WHERE id=$${vals.length}`, vals);
+          updated++;
+        }
+        idOf.set(String(r.key), id);
+        continue;
+      }
       const name = String(r.name || '').trim().slice(0, 300);
       if (!name) continue;
       const parentId = r.parent_key != null && idOf.has(String(r.parent_key)) ? idOf.get(String(r.parent_key)) : null;
@@ -496,6 +843,7 @@ api.post('/import', editor, async (req, res) => {
           Math.max(0, Math.min(100, intOr(r.percent, 0))), owners[i], String(r.notes || '').slice(0, 20000),
           kind !== 'milestone' && isDate(r.deadline) && r.deadline ? r.deadline : null]))[0];
       idOf.set(String(r.key), t.id);
+      added++;
     }
     // dependencies: skip anything that does not make sense (unknown, itself, between a task and its parent, twice)
     const parent = new Map();
@@ -514,11 +862,19 @@ api.post('/import', editor, async (req, res) => {
       deps++;
     }
     return {
-      result: { project_id: projectId, tasks: idOf.size, deps },
-      audit: { entity: 'project', entity_id: projectId, project_id: projectId, action: 'create', summary: `יובאו ${idOf.size} משימות${deps ? ` ו-${deps} תלויות` : ''} מקובץ אל "${pname}"${b.file ? ` (${String(b.file).slice(0, 80)})` : ''}` },
+      result: { project_id: projectId, tasks: added, updated, deps, pname },
+      audit: { entity: 'project', entity_id: projectId, project_id: projectId, action: added ? 'create' : 'update',
+        summary: `ייבוא מקובץ אל "${pname}": ${[
+          added && (added === 1 ? 'משימה חדשה אחת' : `${added} משימות חדשות`),
+          updated && (updated === 1 ? 'משימה אחת עודכנה' : `${updated} משימות עודכנו`),
+          deps && `${deps} תלויות`].filter(Boolean).join(', ') || 'בלי שינוי'}${b.file ? ` (${String(b.file).slice(0, 80)})` : ''}` },
     };
   });
-  res.json(result);
+  const per = new Map();
+  rows.forEach((r, i) => { if (r.update_id == null && String(r.name || '').trim() && owners[i] != null) per.set(owners[i], (per.get(owners[i]) || 0) + 1); });
+  const { pname, ...out } = result;
+  await notifyAssign(req, [...per].map(([unit, n]) => ({ unit, kind: 'assign_many', name: pname, detail: n })));
+  res.json(out);
 });
 
 // ------------------------------------------------------------------ dependencies
@@ -531,7 +887,6 @@ api.post('/dependencies', editor, async (req, res) => {
   const { result, moved } = await mutate(req.user, async (tx, before) => {
     const pt = before.tasks.get(p), st = before.tasks.get(s);
     if (!pt || !st) throw new HttpError(404, 'משימה לא נמצאה');
-    mustEdit(req, units, before, s, 'לקשר אל המשימה הזו (תלות משנה את התאריכים שלה)');
     if (p === s) throw new HttpError(400, 'משימה לא יכולה להיות תלויה בעצמה');
     if (before.ancestors(s).includes(p) || before.ancestors(p).includes(s)) throw new HttpError(400, 'אי אפשר ליצור תלות בין משימה לבין אב-המשימה שלה. ההיררכיה כבר קושרת ביניהן.');
     const exists = before.validDeps.find((d) => (d.predecessor_id === p && d.successor_id === s) || (d.predecessor_id === s && d.successor_id === p));
@@ -540,6 +895,7 @@ api.post('/dependencies', editor, async (req, res) => {
     const cross = pt.project_id !== st.project_id ? ' (בין פרויקטים)' : '';
     return { result: d, audit: { entity: 'dependency', entity_id: d.id, project_id: st.project_id, task_id: s, action: 'create', summary: `נוספה תלות${cross}: "${st.name}" תלויה ב-"${pt.name}" (${DEP_LABEL[type]}${lag ? `, ${lag > 0 ? '+' : ''}${lag} ימים` : ''})`, details: { predecessor_id: p, successor_id: s, type, lag } } };
   });
+  await notifyDep(req, (await currentSchedule()).sched, 'dep_add', result, `${DEP_LABEL[type]}${lag ? `, ${lag > 0 ? '+' : ''}${lag} ימים` : ''}`);
   res.json({ dependency: result, moved });
 });
 
@@ -547,30 +903,36 @@ api.patch('/dependencies/:id', editor, async (req, res) => {
   const id = idParam(req);
   const b = req.body || {};
   const units = await loadUnits();
+  let changed = null;
   const { moved } = await mutate(req.user, async (tx, before) => {
     const d = (await tx.query('SELECT * FROM dependencies WHERE id=$1', [id]))[0];
     if (!d) throw new HttpError(404, 'התלות לא נמצאה');
-    mustEdit(req, units, before, d.successor_id, 'לשנות את התלות הזו');
+    mustEditOne(req, units, before, d, 'לשנות את התלות הזו');
     const type = DEP_TYPES.includes(b.type) ? b.type : d.type;
     const lag = 'lag' in b ? Math.max(-500, Math.min(500, intOr(b.lag, d.lag))) : d.lag;
     await tx.query('UPDATE dependencies SET type=$1, lag=$2 WHERE id=$3', [type, lag, id]);
     const st = before.tasks.get(d.successor_id), pt = before.tasks.get(d.predecessor_id);
+    changed = { d, sched: before, detail: `${DEP_LABEL[type]}${lag ? `, ${lag > 0 ? '+' : ''}${lag} ימים` : ''}` };
     return { audit: { entity: 'dependency', entity_id: id, project_id: st?.project_id, task_id: d.successor_id, action: 'update', summary: `עודכנה תלות "${st?.name}" ב-"${pt?.name}": ${DEP_LABEL[d.type]} ${d.lag} → ${DEP_LABEL[type]} ${lag}` } };
   });
+  if (changed) await notifyDep(req, changed.sched, 'dep_edit', changed.d, changed.detail);
   res.json({ ok: true, moved });
 });
 
 api.delete('/dependencies/:id', editor, async (req, res) => {
   const id = idParam(req);
   const units = await loadUnits();
+  let removed = null;
   const { moved } = await mutate(req.user, async (tx, before) => {
     const d = (await tx.query('SELECT * FROM dependencies WHERE id=$1', [id]))[0];
     if (!d) throw new HttpError(404, 'התלות לא נמצאה');
-    mustEdit(req, units, before, d.successor_id, 'להסיר את התלות הזו');
+    mustEditOne(req, units, before, d, 'להסיר את התלות הזו');
+    removed = { d, sched: before };
     await tx.query('DELETE FROM dependencies WHERE id=$1', [id]);
     const st = before.tasks.get(d.successor_id), pt = before.tasks.get(d.predecessor_id);
     return { audit: { entity: 'dependency', entity_id: id, project_id: st?.project_id, task_id: d.successor_id, action: 'delete', summary: `הוסרה תלות: "${st?.name}" כבר לא תלויה ב-"${pt?.name}"` } };
   });
+  if (removed) await notifyDep(req, removed.sched, 'dep_del', removed.d);
   res.json({ ok: true, moved });
 });
 
@@ -607,6 +969,31 @@ function historyWhere(q) {
   return { where, vals };
 }
 // newest first; "before" (an id) gives the next page
+/**
+ * Every postponement on record (newest first), for the "delays" tab of the history page: the task as
+ * it is now (name, project, owner), why, by whom, how far it moved (working days), and the task that
+ * caused it when it moved because of another one. Rows of deleted tasks are left out.
+ */
+api.get('/delays', viewer, async (_req, res) => {
+  const { sched } = await currentSchedule();
+  const rows = await db.query('SELECT * FROM task_delays ORDER BY id DESC LIMIT 5000');
+  const out = [];
+  for (const r of rows) {
+    const t = sched.tasks.get(r.task_id);
+    if (!t) continue;
+    const from = isoDate(r.from_finish), to = isoDate(r.to_finish);
+    out.push({
+      id: r.id, at: r.at, task_id: r.task_id, name: t.name, kind: t.kind, project_id: t.project_id,
+      owner_unit_id: effectiveOwner(sched, r.task_id), user_name: r.user_name, unit_id: r.unit_id,
+      reason: r.reason, reason_other: r.reason_other, description: r.description,
+      cause_task_id: r.cause_task_id, cause_name: r.cause_task_id != null ? sched.tasks.get(r.cause_task_id)?.name || null : null,
+      from_finish: from, to_finish: to,
+      days: from && to ? Math.max(0, sched.cal.idxOf(toDay(to)) - sched.cal.idxOf(toDay(from))) : null,
+    });
+  }
+  res.json(out);
+});
+
 api.get('/history', viewer, async (req, res) => {
   const { where, vals } = historyWhere(req.query);
   if (req.query.before) { vals.push(intOr(req.query.before, 0)); where.push(`id < $${vals.length}`); }
@@ -621,6 +1008,16 @@ api.get('/history/meta', viewer, async (req, res) => {
   const people = (await db.query(`SELECT DISTINCT user_name FROM audit_log WHERE ${all}`)).map((r) => r.user_name).filter(Boolean);
   const actions = (await db.query(`SELECT DISTINCT action FROM audit_log WHERE ${all}`)).map((r) => r.action);
   res.json({ count: n, people, actions, days: HISTORY_DAYS });
+});
+
+// delete the whole history (branch management only). One entry stays: who deleted it, and when.
+api.delete('/history', admin, async (req, res) => {
+  const [{ n }] = await db.query('SELECT count(*)::int AS n FROM audit_log');
+  await db.query('DELETE FROM audit_log');
+  await audit(req.user, { entity: 'plan', action: 'delete', summary: `כל היסטוריית השינויים נמחקה (${n} רשומות)` });
+  try { await db.exec('VACUUM audit_log'); } catch { /* not critical */ }
+  broadcast({ type: 'changed', by: req.user.display_name, summary: 'היסטוריית השינויים נמחקה' });
+  res.json({ ok: true, deleted: n });
 });
 
 // ------------------------------------------------------------------ calendar
@@ -644,6 +1041,16 @@ api.put('/calendar', admin, async (req, res) => {
     return { audit: { entity: 'calendar', action: 'update', summary: 'עודכנו הגדרות החגים' } };
   });
   res.json({ ok: true });
+});
+
+// branch management: ask (or not) why a task with an original plan is postponed
+api.put('/settings/delay-reasons', admin, async (req, res) => {
+  const on = req.body?.on !== false;
+  await mutate(req.user, async (tx) => {
+    await tx.query(`INSERT INTO settings (key, value) VALUES ('delay_reasons', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify(on)]);
+    return { audit: { entity: 'settings', action: 'update', summary: on ? 'הופעלה בקשת סיבה לדחיית משימות' : 'כובתה בקשת סיבה לדחיית משימות' } };
+  });
+  res.json({ ok: true, on });
 });
 
 const rangeText = (a, b) => (a === b ? a : `${a} עד ${b}`);
@@ -732,11 +1139,21 @@ api.patch('/users/:id', admin, async (req, res) => {
   res.json(publicUser(nu));
 });
 
+/** the reason sent with a postponement: one of the fixed list ("other" needs its text), plus an optional description */
+function delayOf(d) {
+  if (!d) return null;
+  const reason = String(d.reason || '');
+  if (!(reason in DELAY_REASONS)) throw new HttpError(400, 'צריך לבחור סיבה לדחייה מהרשימה.');
+  const reason_other = String(d.reason_other || '').trim().slice(0, 200);
+  if (reason === 'other' && !reason_other) throw new HttpError(400, 'בסיבה "אחר" צריך לכתוב מה הסיבה.');
+  return { reason, reason_other: reason === 'other' ? reason_other : '', description: String(d.description || '').trim().slice(0, 2000) };
+}
+
 // ------------------------------------------------------------------ errors
 api.use((req, _res, next) => next(new HttpError(404, 'נתיב לא קיים')));
 // eslint-disable-next-line no-unused-vars
 api.use((err, _req, res, _next) => {
   const status = err.status || 500;
   if (status >= 500) console.error(err);
-  res.status(status).json({ error: status >= 500 ? 'שגיאה בשרת. הפרטים נרשמו ביומן השרת.' : err.message });
+  res.status(status).json({ error: status >= 500 ? 'שגיאה בשרת. הפרטים נרשמו ביומן השרת.' : err.message, ...(status < 500 && err.data ? err.data : {}) });
 });

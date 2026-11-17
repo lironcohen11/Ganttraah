@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../ctx';
 import { api } from '../api';
-import { buildRows, type Row } from '../model';
+import { buildRows, Model, type Row } from '../model';
+import { sampleModel } from '../tourSample';
 import type { Task } from '../types';
 import { Gantt, Legend, ZOOMS, type Zoom } from './Gantt';
 import { TaskPanel } from './TaskPanel';
@@ -10,6 +11,7 @@ import { Icon } from './Icon';
 import { OwnerFilter } from './OwnerFilter';
 import { exportExcel, exportMsProject, download, fileStamp } from '../export';
 import { ImportDialog } from './ImportDialog';
+import { BacklogPanel } from './BacklogPanel';
 
 const ls = {
   get<T>(k: string, d: T): T { try { const v = localStorage.getItem('gantraah.' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
@@ -40,7 +42,6 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
   const [zoom, setZoom] = useState<Zoom>(() => ls.get('zoom', 'week'));
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(ls.get<string[]>('collapsed', [])));
   const [filter, setFilter] = useState<number[] | null>(() => ls.get('filter', null));
-  const [allProjects, setAllProjects] = useState(() => ls.get('allProjects', false));
   const [favOnly, setFavOnly] = useState(() => ls.get('favOnly', false));
   const [showBaseline, setShowBaseline] = useState(() => ls.get('baseline.v2', false));
   const [showCritical, setShowCritical] = useState(() => ls.get('critical', false));
@@ -52,12 +53,30 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
   const [scrollToken, setScrollToken] = useState(0);
   const [revealId, setRevealId] = useState<number | null>(null);
   const [importing, setImporting] = useState(false);
+  // did the toolbar wrap to a second row? (then Backlog stays at the left end of the top row)
+  const barRef = useRef<HTMLDivElement>(null);
+  const [barWrapped, setBarWrapped] = useState(false);
+  useLayoutEffect(() => {
+    const bar = barRef.current;
+    if (!bar) return;
+    const check = () => {
+      const kids = [...bar.children] as HTMLElement[];
+      const tops = kids.filter((k) => k.offsetParent).map((k) => k.offsetTop);
+      setBarWrapped(tops.length > 0 && Math.max(...tops) - Math.min(...tops) > 8);
+    };
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, []);
+  // the task pool (tasks with no date yet): a drawer of its own, in the place of the task panel
+  const [poolOpen, setPoolOpen] = useState(() => ls.get('pool', false));
+  useEffect(() => ls.set('pool', poolOpen), [poolOpen]);
 
   useEffect(() => ls.set('zoom', zoom), [zoom]);
   useEffect(() => ls.set('collapsed', [...collapsed]), [collapsed]);
   useEffect(() => ls.set('filter', filter), [filter]);
   useEffect(() => ls.set('owners', owners), [owners]);
-  useEffect(() => ls.set('allProjects', allProjects), [allProjects]);
   useEffect(() => ls.set('favOnly', favOnly), [favOnly]);
   useEffect(() => ls.set('baseline.v2', showBaseline), [showBaseline]);
   useEffect(() => ls.set('critical', showCritical), [showCritical]);
@@ -67,6 +86,18 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
   const projectIds = filter?.filter((id) => model.project(id)) ?? null;
   const ownerIds = owners.filter((id) => model.units.has(id));
   const favSet = favOnly ? model.favorites : null;
+  // the tour in an empty system shows a sample project for one step: on screen only, nothing is saved
+  const [sample, setSample] = useState<Model | null>(null);
+  useEffect(() => {
+    const h = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      if (d === 'sample-on' && !model.data.tasks.length) setSample(sampleModel(model.data.today));
+      else if (d === 'sample-off' || d === 'end') setSample(null);
+    };
+    window.addEventListener('gantraah-tour', h);
+    return () => window.removeEventListener('gantraah-tour', h);
+  }, [model]);
+  const sampleRows = useMemo(() => (sample ? buildRows(sample, { projectIds: null, collapsed: new Set(), owners: [], only: null }) : null), [sample]);
   const rows = useMemo(() => buildRows(model, { projectIds: projectIds?.length ? projectIds : null, collapsed, owners: ownerIds, only: favSet }),
     [model, projectIds?.join(','), collapsed, ownerIds.join(','), favSet]);
   const selectedRow = rows.find((r) => r.key === selectedKey) || null;
@@ -78,8 +109,6 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
   const myUnits = useMemo(() => (isAdmin || user.unit_id == null ? [] : model.unitSubtree(user.unit_id)), [model, isAdmin, user.unit_id]);
   const mine = model.projectList.filter((p) => model.projectHasUnit(p.id, myUnits));
   const others = model.projectList.length - mine.length;
-  const chipProjects = allProjects || !others ? model.projectList : model.projectList.filter((p) => mine.includes(p) || projectIds?.includes(p.id));
-
   const reveal = (id: number) => {
     const t = model.task(id);
     if (!t) return;
@@ -95,11 +124,14 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
     setTimeout(() => setRevealId(id), 30);
   };
   useEffect(() => { if (openRequest) reveal(openRequest.id); /* eslint-disable-next-line */ }, [openRequest?.n]);
+  // a task just placed from the pool: shown once the refreshed plan has it
+  const [placedId, setPlacedId] = useState<number | null>(null);
+  useEffect(() => { if (placedId != null && model.task(placedId)) { setPlacedId(null); reveal(placedId); } /* eslint-disable-next-line */ }, [model, placedId]);
   useEffect(() => { if (panelId && !model.task(panelId)) setPanelId(null); }, [model, panelId]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !(e.target as HTMLElement)?.closest?.('input,textarea,select')) { setSelectedKey(null); setPanelId(null); }
+      if (e.key === 'Escape' && !(e.target as HTMLElement)?.closest?.('input,textarea,select')) { setSelectedKey(null); setPanelId(null); setPoolOpen(false); }
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
@@ -108,18 +140,25 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
   const onSelectRow = (r: Row | null) => {
     if (!r) { setSelectedKey(null); return; }
     setSelectedKey(r.key);
-    if (r.type === 'task') setPanelId(r.task.id);
+    if (r.type === 'task') { setPanelId(r.task.id); setPoolOpen(false); }
     else setPanelId(null);
   };
   const toggle = (key: string) => setCollapsed((c) => { const n = new Set(c); if (n.has(key)) n.delete(key); else n.add(key); return n; });
 
+  const adding = useRef(false);
   const addTask = async (kind: 'task' | 'milestone', asChild = false) => {
+    if (adding.current) return; // a double click creates one task, not two
+    adding.current = true;
+    try { await addTaskNow(kind, asChild); } finally { adding.current = false; }
+  };
+  const addTaskNow = async (kind: 'task' | 'milestone', asChild: boolean) => {
     const body: Record<string, unknown> = { kind };
     if (!selectedRow || selectedRow.type === 'group') {
       const p = (projectIds?.length ? model.project(projectIds[0]) : null) || mine[0] || model.projectList[0];
       if (!p) { toast('צריך ליצור פרויקט קודם', 'error'); return; }
       body.project_id = p.id;
-    } else if (selectedRow.type === 'project') body.project_id = selectedRow.project.id;
+      body.first = true; // right under the project's row, not at the bottom of the list
+    } else if (selectedRow.type === 'project') { body.project_id = selectedRow.project.id; body.first = true; }
     else {
       const t = selectedRow.task;
       body.project_id = t.project_id;
@@ -162,7 +201,7 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
 
   return (
     <div className="page gantt-page">
-      <div className="toolbar">
+      <div className={`toolbar ${barWrapped ? 'wrapped' : ''}`} ref={barRef}>
         {canEdit && (
           <div className="tb-group icons" data-tour="undo">
             {(['undo', 'redo'] as const).map((k) => {
@@ -221,6 +260,17 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
           <label className="toggle"><input type="checkbox" checked={showBaseline} onChange={(e) => setShowBaseline(e.target.checked)} /> תכנון מול ביצוע</label>
           <label className="toggle"><input type="checkbox" checked={showCritical} onChange={(e) => setShowCritical(e.target.checked)} /> נתיב קריטי</label>
         </div>
+        {/* Backlog (the task pool): an icon with the count on it, at the left end of the top row */}
+        {!sample && import.meta.env.VITE_DEMO !== '1' && (
+          <div className="tb-group backlog-wrap">
+            <button data-tour="pool" className={`btn backlog-btn ${poolOpen ? 'pressed' : ''}`} onClick={() => { const v = !poolOpen; setPoolOpen(v); if (v) setPanelId(null); }}
+              aria-pressed={poolOpen} aria-label={`Backlog${model.data.backlog?.length ? `: ${model.data.backlog.length} משימות` : ''}`}
+              title="Backlog: משימות שעוד אין להן תאריך. לא מופיעות בגאנט עד שמשבצים אותן.">
+              <Icon name="inbox" size={18} />
+              {(model.data.backlog?.length ?? 0) > 0 && <span className="backlog-count">{model.data.backlog!.length > 99 ? '99+' : model.data.backlog!.length}</span>}
+            </button>
+          </div>
+        )}
         <div className="tb-end" data-tour="owners">
           <OwnerFilter model={model} value={owners} onChange={setOwners} />
           <Dropdown label={<><Icon name="file" size={15} /> קובץ</>}>
@@ -257,23 +307,7 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
       </div>
 
       <div className="filters" data-tour="filters">
-        <button className={`fchip ${!projectIds?.length ? 'on' : ''}`} onClick={() => setFilter(null)}>הכול</button>
-        {chipProjects.map((p) => {
-          const on = !!projectIds?.includes(p.id);
-          return (
-            <span key={p.id} className={`fchip ${on ? 'on' : ''}`}>
-              <button onClick={() => setFilter(on ? (projectIds!.filter((x) => x !== p.id)) : [...(projectIds || []), p.id])} title={`${p.name}: ${p.percent}% הושלמו`}>
-                <span className="proj-chip" style={{ background: p.color }} />{p.name}<span className="fchip-pct">{p.percent}%</span>
-              </button>
-              {isAdmin && <button className="fchip-edit" title="עריכת פרויקט" onClick={() => setProjDialog(p.id)}><Icon name="edit" size={12} /></button>}
-            </span>
-          );
-        })}
-        {others > 0 && (
-          <button className="link small more-proj" onClick={() => setAllProjects(!allProjects)}>
-            {allProjects ? 'רק הפרויקטים שלי' : `+ עוד ${others === 1 ? 'פרויקט אחד' : `${others} פרויקטים`}`}
-          </button>
-        )}
+        <ProjectChips mine={sample ? sample.projectList : mine} projectIds={projectIds} setFilter={setFilter} onEdit={setProjDialog} sample={sample} />
         <span className="filters-sep" />
         <button className={`fchip fav ${favOnly ? 'on' : ''}`} onClick={() => setFavOnly(!favOnly)} disabled={!favCount && !favOnly}
           title={favCount ? 'הצגת המשימות שסימנת בכוכב בלבד' : 'עוד לא סימנת משימות. מסמנים בכוכב שבפאנל המשימה.'}>
@@ -296,11 +330,11 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
       )}
 
       <div className="gantt-main">
-        <Gantt model={model} rows={rows} mode="edit" zoom={zoom} selectedKey={selectedKey}
-          onSelectRow={onSelectRow}
+        <Gantt model={sample ?? model} rows={sampleRows ?? rows} mode="edit" zoom={zoom} onZoom={setZoom} selectedKey={sample ? null : selectedKey}
+          onSelectRow={sample ? () => {} : onSelectRow}
           onOpenRow={(r) => { if (r.type === 'project' && isAdmin) setProjDialog(r.project.id); if (r.type === 'task') focusTask(r.task.id); }}
           highlight={highlight} showBaseline={showBaseline} showCritical={showCritical} showOwners
-          collapsed={collapsed} onToggle={toggle} editable={canEdit} canEditTask={canEditTask}
+          collapsed={collapsed} onToggle={toggle} editable={canEdit && !sample} canEditTask={canEditTask}
           onMoveTask={(id, start) => run(() => api.patch(`/tasks/${id}`, { start_constraint: start }))}
           onResizeTask={(id, duration) => run(() => api.patch(`/tasks/${id}`, { duration }))}
           onLink={(a, b) => run(() => api.post('/dependencies', { predecessor_id: a, successor_id: b, type: 'FS' }), 'התלות נוספה')}
@@ -309,6 +343,9 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
           nameW={nameW} onNameW={setNameW}
           scrollToken={scrollToken} revealId={revealId} />
         {panelId != null && model.task(panelId) && <TaskPanel key={panelId} taskId={panelId} onClose={() => { setPanelId(null); }} />}
+        {poolOpen && panelId == null && !sample && (
+          <BacklogPanel onClose={() => setPoolOpen(false)} onScheduled={(id) => { setPoolOpen(false); setPlacedId(id); }} />
+        )}
       </div>
 
       {importing && <ImportDialog onClose={() => setImporting(false)} />}
@@ -319,3 +356,93 @@ export function GanttPage({ openRequest }: { openRequest: { id: number; n: numbe
     </div>
   );
 }
+
+/**
+ * The project chips. My projects (and any chosen one) always show; the others open after them:
+ * the area grows in height in one smooth movement (the Gantt below follows it), the new chips
+ * fade in one after the other, and on closing they fade out first and then the area shrinks.
+ * The button that opens them stays in one place, outside the area. A component of its own, so
+ * opening and closing re-draws only the chips, not the whole Gantt (that made the motion stutter).
+ */
+function ProjectChips({ mine, projectIds, setFilter, onEdit, sample }: {
+  mine: { id: number }[]; projectIds: number[] | null; setFilter: (v: number[] | null) => void; onEdit: (id: number) => void; sample?: Model | null;
+}) {
+  const app = useApp();
+  const model = sample ?? app.model, isAdmin = app.isAdmin && !sample;
+  const others = model.projectList.length - mine.length;
+  const [open, setOpen] = useState(() => ls.get('allProjects', false));
+  useEffect(() => ls.set('allProjects', open), [open]);
+  const [showMore, setShowMore] = useState(open);          // the other chips are in the page
+  const [leaving, setLeaving] = useState(false);           // ...and are fading out
+  const [openedWith, setOpenedWith] = useState<number[]>([]); // chosen ones at opening keep their place
+  const area = useRef<HTMLDivElement>(null);
+  const inner = useRef<HTMLDivElement>(null);
+  const fromH = useRef<number | null>(null);
+  const timer = useRef<number | undefined>(undefined);
+  const still = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const isMine = (id: number) => mine.some((m) => m.id === id);
+  const firstChips = !others ? model.projectList
+    : model.projectList.filter((p) => isMine(p.id) || (showMore ? openedWith : projectIds || []).includes(p.id));
+  const moreChips = showMore ? model.projectList.filter((p) => !firstChips.includes(p)) : [];
+  const toggle = () => {
+    clearTimeout(timer.current);
+    fromH.current = area.current?.offsetHeight ?? null;
+    if (!open) {
+      setOpenedWith(projectIds || []); setLeaving(false); setShowMore(true); setOpen(true);
+    } else {
+      setOpen(false); setLeaving(true);
+      timer.current = window.setTimeout(() => {
+        fromH.current = area.current?.offsetHeight ?? null;
+        setShowMore(false); setLeaving(false);
+      }, still() ? 0 : 150);
+    }
+  };
+  useEffect(() => () => clearTimeout(timer.current), []);
+  // the height glides from what it was to what the chips need now
+  useLayoutEffect(() => {
+    const a = area.current, i = inner.current, from = fromH.current;
+    fromH.current = null;
+    if (!a || !i || from == null) return;
+    const to = i.offsetHeight;
+    if (Math.abs(to - from) < 2 || still()) return;
+    a.style.transition = 'none';
+    a.style.height = `${from}px`;
+    void a.offsetHeight;
+    a.style.transition = 'height .28s cubic-bezier(.2, .8, .2, 1)';
+    a.style.height = `${to}px`;
+    const done = () => { a.style.height = ''; a.style.transition = ''; a.removeEventListener('transitionend', done); };
+    a.addEventListener('transitionend', done);
+    const safety = window.setTimeout(done, 700);
+    return () => { clearTimeout(safety); a.removeEventListener('transitionend', done); };
+  }, [showMore]);
+  const chip = (p: (typeof model.projectList)[number], k = -1) => {
+    const on = !!projectIds?.includes(p.id);
+    const extra = k >= 0;
+    return (
+      <span key={p.id} className={`fchip ${on ? 'on' : ''} ${extra ? (leaving ? 'chip-out' : 'chip-in') : ''}`}
+        style={extra && !leaving ? { animationDelay: `${Math.min(k * 22, 220)}ms` } : undefined}>
+        <button onClick={() => setFilter(on ? (projectIds!.filter((x) => x !== p.id)) : [...(projectIds || []), p.id])} title={p.name}>
+          <span className="proj-chip" style={{ background: p.color }} />{p.name}
+        </button>
+        {isAdmin && <button className="fchip-edit" title="עריכת פרויקט" onClick={() => onEdit(p.id)}><Icon name="edit" size={12} /></button>}
+      </span>
+    );
+  };
+  return (
+    <>
+      <div className="proj-area" ref={area}>
+        <div className="proj-chips" ref={inner}>
+          <button className={`fchip ${!projectIds?.length ? 'on' : ''}`} onClick={() => setFilter(null)}>הכול</button>
+          {firstChips.map((p) => chip(p))}
+          {moreChips.map((p, k) => chip(p, k))}
+        </div>
+      </div>
+      {others > 0 && (
+        <button className="link small more-proj" onClick={toggle} aria-expanded={open}>
+          {open ? <>רק הפרויקטים שלי <Icon name="chevronRight" size={13} /></> : <>שאר הפרויקטים ({others}) <Icon name="chevronLeft" size={13} /></>}
+        </button>
+      )}
+    </>
+  );
+}
+

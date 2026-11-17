@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api } from './api';
+import { api, type DelayPreview, CLIENT_ID } from './api';
 import { Model } from './model';
 import type { AppData, User, Unit } from './types';
-import { AppCtx, movedMessage, type Ctx, type SimOverlay } from './ctx';
+import { AppCtx, movedMessage, type Ctx, type SimOverlay, type RemoteChange } from './ctx';
 import { GanttPage } from './components/GanttPage';
 import { FocusView } from './components/FocusView';
 import { PresentView } from './components/PresentView';
@@ -10,11 +10,13 @@ import { HistoryView } from './components/HistoryView';
 import { SettingsView } from './components/SettingsView';
 import { Icon } from './components/Icon';
 import { OrgLogos } from './components/OrgLogos';
+import { DelayDialog } from './components/DelayDialog';
 import { LandingBg } from './components/LandingBg';
+import { Bell } from './components/Bell';
 import { getThemePref, setThemePref, type ThemePref } from './theme';
 import logoUrl from './assets/logo.png';
 import logoDarkUrl from './assets/logo-dark.png';
-import { Tour, tourSeen, markTourSeen, PRESENT_STEPS, SETTINGS_STEPS, ORG_STEPS } from './components/Tour';
+import { Tour, tourSeen, markTourSeen, PRESENT_STEPS, SETTINGS_STEPS, ORG_STEPS, FOCUS_STEPS, HISTORY_STEPS } from './components/Tour';
 
 // Every new visit starts at the landing page ("choose your team"). Within the same browser
 // tab the choice is kept, so refreshing the page does not send you back there.
@@ -28,6 +30,20 @@ export function App() {
   useEffect(() => {
     if (!ss.get()) { setUser(null); return; }
     api.get<{ user: User | null }>('/me').then((r) => setUser(r.user)).catch(() => setUser(null));
+  }, []);
+  // Esc closes the dialog on top, the same as a click outside it
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      const bgs = document.querySelectorAll<HTMLElement>('.modal-bg, .td-bg');
+      const bg = bgs[bgs.length - 1];
+      if (!bg) return;
+      e.preventDefault();
+      bg.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      if (bg.isConnected) bg.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
   }, []);
   if (user === undefined) return <div className="splash"><Logo /></div>;
   if (!user) return <Landing onEnter={(u) => { ss.set(true); setUser(u); }} />;
@@ -55,6 +71,7 @@ function resetFilters(units: Unit[], u: User) {
     localStorage.setItem('gantraah.filter', 'null');
     localStorage.setItem('gantraah.allProjects', 'false');
     localStorage.setItem('gantraah.favOnly', 'false');
+    localStorage.removeItem('gantraah.panelX'); // the task card starts in its place again
     for (const k of ['gantraah.meet.pick', 'gantraah.meet.ownerFilter', 'gantraah.meet.favOnly', 'gantraah.whatif']) localStorage.removeItem(k);
   } catch { /* ignore */ }
   if (location.hash && location.hash !== '#/gantt') history.replaceState(null, '', '#/gantt');
@@ -225,11 +242,22 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [openRequest, setOpenRequest] = useState<{ id: number; n: number } | null>(null);
   const [lastFocus, setLastFocus] = useState<number | null>(null);
   const [sim, setSim] = useState<SimOverlay | null>(null);
-  const [tour, setTour] = useState<false | 'main' | 'present' | 'settings' | 'org'>(false);
+  const [tour, setTour] = useState<false | 'main' | 'present' | 'settings' | 'org' | 'focus' | 'history'>(false);
   // the tour of the screen you are on: the manager view has its own short one
   const startTour = () => {
     if (location.hash.startsWith('#/present')) { setTour('present'); return; }
+    if (location.hash.startsWith('#/history')) { setTour('history'); return; }
     if (location.hash.startsWith('#/settings')) { setTour(document.querySelector('.org-tree.edit') ? 'org' : 'settings'); return; }
+    if (location.hash.startsWith('#/focus')) {
+      if (!document.querySelector('.impact') && data) {
+        const links = new Map<number, number>();
+        for (const d of data.dependencies) for (const id of [d.predecessor_id, d.successor_id]) links.set(id, (links.get(id) || 0) + 1);
+        const best = [...links].sort((a, b) => b[1] - a[1])[0];
+        if (best) { setLastFocus(best[0]); location.hash = '#/focus/' + best[0]; setTimeout(() => setTour('focus'), 450); return; }
+      }
+      setTour('focus');
+      return;
+    }
     if (location.hash && !location.hash.startsWith('#/gantt')) location.hash = '#/gantt';
     setTimeout(() => setTour('main'), 350);
   };
@@ -254,29 +282,46 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   }, [toast]);
   useEffect(() => { reload(); }, [reload]);
 
+  // who has which task card open (other tabs), and the latest change made by someone else
+  const [presence, setPresence] = useState<Record<string, { c: string; n: string }[]>>({});
+  const [remote, setRemote] = useState<RemoteChange | null>(null);
+  const remoteSeq = useRef(0);
+  const viewing = useRef<number | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const sendViewing = useCallback(() => {
+    const w = wsRef.current;
+    if (w && w.readyState === 1) w.send(JSON.stringify({ type: 'view', client: CLIENT_ID, task: viewing.current }));
+  }, []);
+  const setViewing = useCallback((id: number | null) => { if (viewing.current !== id) { viewing.current = id; sendViewing(); } }, [sendViewing]);
+
   // live updates from other users
   useEffect(() => {
     let ws: WebSocket | null = null;
     let stop = false;
     let timer: number | undefined;
+    let dropped = false; // the connection broke at least once
     if (import.meta.env.VITE_DEMO === '1') return; // the demo has no server: nobody else can change the plan
     const connect = () => {
       ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-      ws.onopen = () => setOnline(true);
+      wsRef.current = ws;
+      ws.onopen = () => { setOnline(true); sendViewing(); if (dropped) { dropped = false; reload(); } }; // back after a break: the plan may have changed
       ws.onmessage = (ev) => {
         try {
           const m = JSON.parse(ev.data);
+          if (m.type === 'notify') { reload(); return; }
+          if (m.type === 'presence') { setPresence(m.viewers || {}); return; }
           if (m.type === 'changed') {
+            if (m.client !== CLIENT_ID) setRemote({ seq: ++remoteSeq.current, at: Date.now(), by: m.by || '', task_id: m.task_id ?? null, summary: m.summary || '' });
             reload();
             if (m.by && m.by !== user.display_name && m.summary) toast(`${m.by}: ${m.summary}`);
           }
         } catch { /* ignore */ }
       };
-      ws.onclose = () => { setOnline(false); if (!stop) timer = window.setTimeout(connect, 2500); };
+      ws.onclose = () => { setOnline(false); dropped = true; if (!stop) timer = window.setTimeout(connect, 2500); };
     };
     connect();
     return () => { stop = true; clearTimeout(timer); ws?.close(); };
-  }, [reload, toast, user.display_name]);
+  }, [reload, toast, user.display_name, sendViewing]);
 
   useEffect(() => {
     const h = () => setHash(location.hash || '#/gantt');
@@ -285,10 +330,18 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   }, []);
   const go = useCallback((h: string) => { if (location.hash !== h) location.hash = h; else setHash(h); }, []);
 
-  const model = useMemo(() => (data ? new Model(data) : null), [data]);
+  // while the "why is it postponed?" question is open, the plan behind it shows the new dates
+  const [delayPreview, setDelayPreview] = useState<DelayPreview[] | null>(null);
+  const model = useMemo(() => {
+    if (!data) return null;
+    if (!delayPreview) return new Model(data);
+    const pv = new Map(delayPreview.map((x) => [x.id, x]));
+    return new Model({ ...data, tasks: data.tasks.map((t) => (pv.has(t.id) ? { ...t, ...pv.get(t.id) } : t)) });
+  }, [data, delayPreview]);
   const canEdit = user.role === 'admin' || user.role === 'editor';
 
   const run = useCallback(async <T,>(fn: () => Promise<T>, okMsg?: string) => {
+    setRemote(null);
     try {
       const r = await fn();
       await reload();
@@ -296,7 +349,7 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
       if (okMsg || mm) toast([okMsg, mm].filter(Boolean).join(' · '), 'ok');
       return r;
     } catch (e) {
-      toast((e as Error).message, 'error');
+      if (!(e as { cancelled?: boolean }).cancelled) toast((e as Error).message, 'error'); // cancelled by the user: nothing to say
       await reload();
       return undefined;
     }
@@ -349,6 +402,9 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
     assignable: user.role === 'admin' || user.edit_all ? model.unitTree().map((x) => x.unit) : user.unit_id != null ? model.unitTree(user.unit_id).map((x) => x.unit) : [],
     openTask: (id) => { setOpenRequest({ id, n: Date.now() }); go('#/gantt'); },
     focusTask: (id) => { setLastFocus(id); go(`#/focus/${id}`); },
+    setViewing,
+    viewersOf: (id) => (presence[id] || []).filter((v) => v.c !== CLIENT_ID).map((v) => v.n),
+    remote,
   };
 
   const nav = [
@@ -358,7 +414,7 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
     { id: 'history', label: 'היסטוריה', icon: 'history', href: '#/history' },
     { id: 'settings', label: 'הגדרות', icon: 'settings', href: '#/settings' },
   ];
-  const hasTour = page === 'gantt' || page === 'present' || page === 'settings';
+  const hasTour = page === 'gantt' || page === 'present' || page === 'settings' || page === 'focus' || page === 'history';
 
   return (
     <AppCtx.Provider value={ctx}>
@@ -377,20 +433,22 @@ function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
           {!online && <span className="offline">אין חיבור לשרת, מנסה להתחבר מחדש…</span>}
           {data!.cycle && <span className="chip bad">נמצאה תלות מעגלית</span>}
           <span className="me"><Icon name="user" size={15} />{user.display_name}</span>
+          {user.role !== 'admin' && user.unit_id != null && import.meta.env.VITE_DEMO !== '1' && <Bell />}
           <ThemeButton />
-          {hasTour && <button className="btn small" data-tour="help" title="סיור קצר במסך הזה" onClick={startTour}>סיור</button>}
+          {hasTour && <button className="btn small" data-tour="help" title="סיור קצר במסך שבו נמצאים עכשיו. לכל מסך יש סיור משלו." onClick={startTour}>סיור במסך</button>}
           <button className="btn small" title="יציאה וחזרה לבחירת המסגרת" onClick={onLogout}><Icon name="logout" size={14} /> יציאה</button>
           <span className="topbar-sep" />
           <OrgLogos size={32} />
         </header>
         <main>
           {page === 'gantt' && <GanttPage openRequest={openRequest} />}
-          {tour && <Tour steps={tour === 'present' ? PRESENT_STEPS : tour === 'settings' ? SETTINGS_STEPS : tour === 'org' ? ORG_STEPS : undefined} onClose={() => { if (tour === 'main') markTourSeen(); setTour(false); }} />}
+          {tour && <Tour steps={tour === 'present' ? PRESENT_STEPS : tour === 'settings' ? SETTINGS_STEPS : tour === 'org' ? ORG_STEPS : tour === 'focus' ? FOCUS_STEPS : tour === 'history' ? HISTORY_STEPS : undefined} onClose={() => { if (tour === 'main') markTourSeen(); setTour(false); }} />}
           {page === 'focus' && <FocusView taskId={focusId && model.task(focusId) ? focusId : null} />}
           {page === 'present' && <PresentView />}
           {page === 'history' && <HistoryView />}
           {page === 'settings' && <SettingsView />}
         </main>
+        <DelayDialog onPreview={setDelayPreview} />
         <div className="toasts">
           {toasts.map((t) => <div key={t.id} className={`toast ${t.kind}`}>{t.msg}</div>)}
         </div>

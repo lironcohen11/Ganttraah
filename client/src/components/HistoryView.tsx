@@ -4,6 +4,7 @@ import { api } from '../api';
 import type { AuditEntry } from '../types';
 import { fmtDateTime, fmtDate, daysText } from '../dates';
 import { Icon } from './Icon';
+import { DelaysView } from './DelaysView';
 
 const ACTION_LABEL: Record<string, string> = { create: 'יצירה', update: 'עדכון', delete: 'מחיקה', move: 'העברה', baseline: 'תכנון מקורי', undo: 'ביטול', redo: 'ביצוע שוב' };
 
@@ -11,7 +12,7 @@ const PAGE = 300;
 type HistoryMeta = { count: number; people: string[]; actions: string[]; days: number };
 
 export function HistoryView() {
-  const { model, focusTask, toast } = useApp();
+  const { model, focusTask, toast, isAdmin, run } = useApp();
   const [rows, setRows] = useState<AuditEntry[]>([]);
   const [meta, setMeta] = useState<HistoryMeta>({ count: 0, people: [], actions: [], days: 365 });
   const [project, setProject] = useState('');
@@ -19,6 +20,9 @@ export function HistoryView() {
   const [action, setAction] = useState('');
   const [open, setOpen] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  // two tabs: every change, or the postponements and why
+  const [tab, setTabState] = useState<'all' | 'delays'>(() => { try { return localStorage.getItem('gantraah.histTab') === 'delays' ? 'delays' : 'all'; } catch { return 'all'; } });
+  const setTab = (x: 'all' | 'delays') => { setTabState(x); try { localStorage.setItem('gantraah.histTab', x); } catch { /* ignore */ } };
   // filtering runs on the server, so it covers the whole year and not only the rows loaded so far
   const filter = useMemo(() => {
     const q = new URLSearchParams();
@@ -55,32 +59,48 @@ export function HistoryView() {
   return (
     <div className="page history-page">
       <div className="page-head col">
-        <h1>היסטוריית שינויים</h1>
-        <p className="muted">כל שינוי בתוכנית נרשם כאן: מי שינה, מה שינה, מתי, ואילו משימות זזו בעקבות השינוי. נשמרים השינויים של ה{keep} האחרונה, וישנים יותר נמחקים מעצמם.</p>
-        <div className="hist-filters">
-          <Icon name="filter" size={15} />
-          <label>פרויקט
-            <select value={project} onChange={(e) => setProject(e.target.value)}>
-              <option value="">הכול</option>
-              {model.projectList.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
-          </label>
-          <label>מי שינה
-            <select value={who} onChange={(e) => setWho(e.target.value)}>
-              <option value="">כולם</option>
-              {people.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </label>
-          <label>סוג פעולה
-            <select value={action} onChange={(e) => setAction(e.target.value)}>
-              <option value="">הכול</option>
-              {actions.map((a) => <option key={a} value={a}>{ACTION_LABEL[a] || a}</option>)}
-            </select>
-          </label>
-          {any && <button className="link" onClick={() => { setProject(''); setWho(''); setAction(''); }}>ניקוי הסינון</button>}
-          <span className="muted small">{any ? (meta.count === 1 ? 'שינוי אחד מתאים' : `${meta.count} שינויים מתאימים`) : `${meta.count === 1 ? 'שינוי אחד' : `${meta.count} שינויים`} ב${keep} האחרונה`}</span>
+        <div className="hist-title">
+          <h1>היסטוריה</h1>
+          <div className="seg">
+            <button className={tab === 'all' ? 'on' : ''} onClick={() => setTab('all')}>כל השינויים</button>
+            <button className={tab === 'delays' ? 'on' : ''} onClick={() => setTab('delays')}>דחיות</button>
+          </div>
         </div>
+        {tab === 'delays' ? null : <>
+        <p className="muted">כל שינוי בתוכנית נרשם כאן: מי שינה, מה שינה, מתי, ואילו משימות זזו בעקבות השינוי. נשמרים השינויים של ה{keep} האחרונה, וישנים יותר נמחקים מעצמם.</p>
+        <div className="hist-top">
+          <div className="hist-filters">
+            <Icon name="filter" size={15} />
+            <label>פרויקט
+              <select value={project} onChange={(e) => setProject(e.target.value)}>
+                <option value="">הכול</option>
+                {model.projectList.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </label>
+            <label>מי שינה
+              <select value={who} onChange={(e) => setWho(e.target.value)}>
+                <option value="">כולם</option>
+                {people.map((p) => <option key={p} value={p}>{p}</option>)}
+              </select>
+            </label>
+            <label>סוג פעולה
+              <select value={action} onChange={(e) => setAction(e.target.value)}>
+                <option value="">הכול</option>
+                {actions.map((a) => <option key={a} value={a}>{ACTION_LABEL[a] || a}</option>)}
+              </select>
+            </label>
+            {any && <button className="link" onClick={() => { setProject(''); setWho(''); setAction(''); }}>ניקוי הסינון</button>}
+            <span className="muted small">{any ? (meta.count === 1 ? 'שינוי אחד מתאים' : `${meta.count} שינויים מתאימים`) : `${meta.count === 1 ? 'שינוי אחד' : `${meta.count} שינויים`} ב${keep} האחרונה`}</span>
+          </div>
+            {isAdmin && (
+              <button className="btn danger-outline hist-clear" onClick={() => {
+                if (confirm('למחוק את כל היסטוריית השינויים? הפעולה הזו לא ניתנת לביטול. התוכנית עצמה לא משתנה.')) run(() => api.del('/history'), 'ההיסטוריה נמחקה');
+              }}><Icon name="trash" size={14} /> מחיקת כל ההיסטוריה</button>
+            )}
+        </div>
+        </>}
       </div>
+      {tab === 'delays' ? <DelaysView /> : (
       <div className="hist-table">
         <div className="hist-row head"><span>מתי</span><span>מי</span><span>פעולה</span><span>מה השתנה</span></div>
         {shown.map((h) => {
@@ -115,6 +135,7 @@ export function HistoryView() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }

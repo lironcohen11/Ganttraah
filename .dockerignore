@@ -2,4 +2,9 @@
 data
 deploy/out
 client/dist
+client/dist-demo
+client/dist-demo-empty
+docs
+logs
 .env
+*.pptx

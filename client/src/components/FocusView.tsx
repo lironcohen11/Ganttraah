@@ -232,7 +232,7 @@ export function FocusView({ taskId }: { taskId: number | null }) {
           <Icon name="deps" size={40} />
           <h2>מפת תלויות</h2>
           <p>בחרו משימה, ותוצג בה כל השרשרת: מה משפיע על המשימה, מה מושפע ממנה, ואיפה היא יושבת בהיררכיה.</p>
-          <div style={{ width: 420 }}><TaskPicker model={model} exclude={new Set()} placeholder="חיפוש משימה…" onPick={(id) => focusTask(id)} /></div>
+          <div style={{ width: 420 }} data-tour="f-pick"><TaskPicker model={model} exclude={new Set()} placeholder="חיפוש משימה…" onPick={(id) => focusTask(id)} /></div>
         </div>
       </div>
     );
@@ -251,11 +251,11 @@ export function FocusView({ taskId }: { taskId: number | null }) {
           {anc.map((a) => <span key={a} className="crumb-sep">›<button onClick={() => focusTask(a)}>{model.task(a)!.name}</button></span>)}
           <span className="crumb-sep">›<b>{t.name}</b></span>
         </div>
-        {!whatIf && <button className="btn" onClick={() => setWhatIf(true)}><Icon name="sim" size={15} /> מה קורה אם…</button>}
-        <div className="focus-search"><TaskPicker model={model} exclude={new Set([t.id])} placeholder="מעבר למשימה אחרת…" onPick={(id) => focusTask(id)} /></div>
+        {!whatIf && <button className="btn" data-tour="f-whatif" onClick={() => setWhatIf(true)}><Icon name="sim" size={15} /> מה קורה אם…</button>}
+        <div className="focus-search" data-tour="f-pick"><TaskPicker model={model} exclude={new Set([t.id])} placeholder="מעבר למשימה אחרת…" onPick={(id) => focusTask(id)} /></div>
       </div>
 
-      {whatIf && <div className="whatif">
+      {whatIf && <div className="whatif" data-tour="f-whatif">
         <button className="icon-btn wi-close" onClick={() => { setLocalSim(null); setMode(null); setWhatIf(false); }} title="סגירה (אפשר לפתוח שוב מהכפתור למעלה)" aria-label="סגירה"><Icon name="x" size={15} /></button>
         <div className="wi-q">
           <Icon name="sim" size={18} />
@@ -349,7 +349,7 @@ function NodeCard({ id, side, edge, extra, shift, blocked, hot, onHover, onGo }:
       <span className="ncard-name">{t.kind === 'milestone' && <Icon name="diamond" size={11} />} {t.name}</span>
       <span className="ncard-dates">{fmtDate(t.start)}{t.kind !== 'milestone' && ` – ${fmtDate(t.finish)}`}</span>
       <span className="ncard-foot">
-        <span className={`st ${t.status}`} /> {STATUS_LABEL[t.status]} · {t.percent}%
+        <span className={`st ${t.status}`} /> {STATUS_LABEL[t.status]}
         {t.children.length > 0 && <span className="muted"> · {t.children.length} תתי-משימות</span>}
       </span>
       {edge && <span className="ncard-dep">{depText(edge.type, edge.lag)}{edge.via ? ` · דרך "${model.task(edge.via)?.name}"` : ''}</span>}
@@ -371,7 +371,7 @@ function Frames({ ancestors, projectId, children }: { ancestors: number[]; proje
     inner = (
       <div className="frame">
         <button className="frame-title" onClick={() => focusTask(a.id)}>
-          <span className="wbs-tag">{a.wbs}</span>{a.name}<span className="muted"> · {a.children.length} תתי-משימות · {a.percent}%</span>
+          <span className="wbs-tag">{a.wbs}</span>{a.name}<span className="muted"> · {a.children.length} תתי-משימות</span>
         </button>
         {inner}
       </div>
@@ -380,7 +380,7 @@ function Frames({ ancestors, projectId, children }: { ancestors: number[]; proje
   return (
     <div className="frame project" style={{ borderColor: pr.color }}>
       <button className="frame-title" onClick={() => go('#/gantt')}>
-        <span className="proj-chip" style={{ background: pr.color }} />{pr.name}<span className="muted"> · פרויקט · {pr.percent}%</span>
+        <span className="proj-chip" style={{ background: pr.color }} />{pr.name}<span className="muted"> · פרויקט</span>
       </button>
       {inner}
     </div>
@@ -407,7 +407,6 @@ function CenterCard({ t, shift, onGo }: { t: Task; shift?: number; onGo: (id: nu
         {model.ownerName(t.id) && <div><span>אחראי</span><b>{model.ownerName(t.id)}</b></div>}
         {t.deadline && <div><span>תאריך יעד</span><b className={t.deadline_missed ? 'bad' : ''}>{fmtDate(t.deadline)}</b></div>}
       </div>
-      <div className="pct-bar big"><i style={{ width: `${t.percent}%`, background: pr.color }} /></div>
       <div className="ccard-notes">
         {driving.length > 0 && <p><b>מה קובע את מועד ההתחלה:</b> {driving.join(', ')}</p>}
         {t.constrained && <p><b>מועד ההתחלה נקבע ידנית</b> ({fmtDate(t.start_constraint)})</p>}
@@ -426,7 +425,7 @@ function CenterCard({ t, shift, onGo }: { t: Task; shift?: number; onGo: (id: nu
                 <button key={c} className="kid-card" onClick={(e) => onGo(c, e.currentTarget)}>
                   <span className={`st ${k.status}`} />
                   <span className="kid-name">{k.kind === 'milestone' && <Icon name="diamond" size={10} />} {k.name}</span>
-                  <span className="kid-meta">{fmtDate(k.finish)} · {k.percent}%{k.children.length ? ` · ${k.children.length} תתי-משימות` : ''}</span>
+                  <span className="kid-meta">{fmtDate(k.finish)}{k.percent >= 100 && !k.children.length ? ' · ✓' : ''}{k.children.length ? ` · ${k.children.length} תתי-משימות` : ''}</span>
                 </button>
               );
             })}

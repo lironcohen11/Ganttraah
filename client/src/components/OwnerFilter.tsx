@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Model } from '../model';
 import { Icon } from './Icon';
+import { useApp } from '../ctx';
 
 /**
  * Filter by owner. Ticking a unit ticks every unit below it; unticking a unit also
@@ -9,6 +10,7 @@ import { Icon } from './Icon';
 export function OwnerFilter({ model, value, onChange }: { model: Model; value: number[]; onChange: (v: number[]) => void }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
+  const { user } = useApp();
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
@@ -37,6 +39,10 @@ export function OwnerFilter({ model, value, onChange }: { model: Model; value: n
   const tops = valid.filter((id) => !ancestors(id).some((a) => set.has(a)));
   const all = tree.length > 0 && tree.every(({ unit }) => set.has(unit.id));
   const label = !valid.length || all ? 'כל המסגרות' : tops.length === 1 ? model.units.get(tops[0])!.name : `${tops.length} מסגרות`;
+  // back to my own tasks in one click: my unit and the units below it (what every entry starts with)
+  const myUnit = user.role !== 'admin' && user.unit_id != null && model.units.has(user.unit_id) ? user.unit_id : null;
+  const mine = myUnit != null ? model.unitSubtree(myUnit) : [];
+  const isMine = myUnit != null && valid.length === mine.length && mine.every((x) => set.has(x));
   return (
     <span className="owner-filter" ref={ref}>
       <button className={`btn ${valid.length && !all ? 'on-filter' : ''}`} onClick={() => setOpen(!open)} title="סינון לפי המסגרת האחראית">
@@ -44,10 +50,15 @@ export function OwnerFilter({ model, value, onChange }: { model: Model; value: n
       </button>
       {open && (
         <div className="of-pop" onClick={(e) => e.stopPropagation()}>
+          {myUnit != null && (
+            <button className={`of-mine ${isMine ? 'on' : ''}`} disabled={isMine} onClick={() => { onChange(mine); setOpen(false); }}>
+              <Icon name="user" size={14} /> {isMine ? 'מוצגות המשימות שלי' : 'חזרה למשימות שלי'}<span className="muted small"> · {model.units.get(myUnit)!.name}{mine.length > 1 ? ' ומי שמתחתיו' : ''}</span>
+            </button>
+          )}
           <input autoFocus placeholder="חיפוש מסגרת…" value={q} onChange={(e) => setQ(e.target.value)} />
           <div className="of-actions">
             <button className="link" onClick={() => onChange(tree.map((x) => x.unit.id))}>בחירת הכול</button>
-            <button className="link" onClick={() => onChange([])}>ביטול הבחירה</button>
+            <button className="link of-clear" onClick={() => onChange([])}>ביטול הבחירה</button>
           </div>
           <div className="of-list">
             {shown.map(({ unit, depth }) => (

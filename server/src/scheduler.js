@@ -163,8 +163,10 @@ export function computeSchedule(data) {
   for (const id of order) {
     const n = node.get(id);
     if (!n.children.length) {
-      n.weight = dur(n);
-      n.pct = Math.max(0, Math.min(100, n.percent | 0));
+      // this version has no partial progress: a task is done (100) or not (anything below counts as 0),
+      // and every task counts once, so a phase or project shows the share of its tasks that are done
+      n.weight = 1;
+      n.pct = (n.percent | 0) >= 100 ? 100 : 0;
       n.costSum = n.cost == null ? null : Number(n.cost);
       continue;
     }
@@ -219,6 +221,38 @@ export function computeSchedule(data) {
     n.critical = n.float != null && n.float <= 0;
   }
 
+  // ---- free slack: how many work days a task can move later (or grow) without moving any other
+  // task or the end of its project. For every task that others depend on: the smallest gap between
+  // what a dependency requires and where the dependent task actually starts. A task inside a phase
+  // also pushes the phase (and what depends on the phase) once it passes the phase's end.
+  const gapFin = new Map(), gapStart = new Map(); // by predecessor id: room before a dependent moves
+  for (const id of order) {
+    const s = node.get(id);
+    if (s.children.length || s.ES == null) continue;
+    const ms = isMs(s), D = dur(s);
+    for (const { dep, direct } of incoming.get(id)) {
+      const p = node.get(dep.predecessor_id);
+      if (p.ES == null) continue;
+      const lag = dep.lag | 0;
+      if (dep.type === 'SS') minSet(gapStart, p.id, s.ES - (p.ES + lag));
+      else if (dep.type === 'FF') { if (direct) minSet(gapFin, p.id, s.ES - (p.EF + lag - (ms ? 0 : D - 1))); }
+      else minSet(gapFin, p.id, s.ES - (p.EF + lag + (ms ? 0 : 1)));
+    }
+  }
+  for (const n of node.values()) {
+    n.freeFloat = null;
+    if (n.children.length || n.ES == null) continue;
+    const pf = projFinish.get(n.project_id);
+    let ff = pf != null ? pf - n.EF : Infinity;
+    if (gapFin.has(n.id)) ff = Math.min(ff, gapFin.get(n.id));
+    if (gapStart.has(n.id)) ff = Math.min(ff, gapStart.get(n.id));
+    for (let a = n.parent_id != null ? node.get(n.parent_id) : null, i = 0; a && i < 100; a = a.parent_id != null ? node.get(a.parent_id) : null, i++) {
+      if (gapFin.has(a.id)) ff = Math.min(ff, gapFin.get(a.id) + (a.EF - n.EF));
+      if (gapStart.has(a.id) && n.ES === a.ES) ff = Math.min(ff, gapStart.get(a.id));
+    }
+    n.freeFloat = Number.isFinite(ff) ? Math.max(0, ff) : null;
+  }
+
   // ---- status vs today
   const todayIdx = cal.idxOf(todayDay);
   const result = new Map();
@@ -231,8 +265,10 @@ export function computeSchedule(data) {
     else expected = todayIdx > n.ES ? 100 : 0;
     const done = n.pct >= 100;
     const late = !done && toDay(finish) < todayDay;
-    const behind = !done && !late && n.ES < todayIdx && n.pct + 15 < expected;
-    const deadline = isMs(n) ? null : n.deadline; // a milestone is a moment, it has no deadline of its own
+    const behind = false; // needs partial progress (reported vs expected), which this version does not have
+    // no separate deadline in this version: the date a task is held to is its original plan (baseline).
+    // The stored value is kept (nothing is lost), but not used or shown.
+    const deadline = null;
     const deadlineMissed = !!deadline && toDay(finish) > toDay(deadline);
     result.set(n.id, {
       id: n.id,
@@ -262,6 +298,9 @@ export function computeSchedule(data) {
       children: n.children,
       critical: n.critical,
       float: Number.isFinite(n.float) ? n.float : null,
+      // free slack (work days) and the latest finish it allows; null for phases
+      free_float: n.freeFloat,
+      free_until: n.freeFloat != null ? fromDay(cal.dayOf(n.EF + n.freeFloat)) : null,
       expected_percent: expected,
       status: done ? 'done' : late ? 'late' : behind ? 'behind' : n.ES > todayIdx ? 'planned' : 'active',
       deadline_missed: deadlineMissed,
@@ -299,6 +338,8 @@ export function computeSchedule(data) {
       behind_count: leaves.filter((t) => t.status === 'behind').length,
       deadline_issues: all.filter((t) => t.deadline_missed).length,
       baseline_finish: maxDate(roots.map((r) => r.baseline_finish)),
+      // the plan ends after the project's estimated finish date
+      target_missed: !!p.target_finish && roots.length > 0 && fromDay(cal.dayOf(Math.max(...roots.map((r) => r._EF)))) > p.target_finish,
       cost_total: sumOrNull(roots.map((r) => r.cost_total)),
     });
   }

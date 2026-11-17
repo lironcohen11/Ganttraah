@@ -113,7 +113,7 @@ export const FIELDS: { id: Field; label: string }[] = [
   { id: 'start', label: 'תאריך התחלה' },
   { id: 'finish', label: 'תאריך סיום' },
   { id: 'duration', label: 'משך (ימי עבודה)' },
-  { id: 'percent', label: 'התקדמות (%)' },
+  { id: 'percent', label: 'הושלמה (100% = כן)' },
   { id: 'owner', label: 'אחראי' },
   { id: 'deadline', label: 'תאריך יעד' },
   { id: 'notes', label: 'הערות' },

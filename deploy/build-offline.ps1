@@ -44,6 +44,7 @@ Copy-Item (Join-Path $root ".env.example") $stage
 Copy-Item (Join-Path $root "README.md") $stage
 Copy-Item -Recurse (Join-Path $root "docs") (Join-Path $stage "docs")
 Copy-Item (Join-Path $PSScriptRoot "start-gantraah.cmd") $stage
+Copy-Item (Join-Path $PSScriptRoot "backup-embedded.ps1") $stage
 $dep = Join-Path $stage "docker"
 New-Item -ItemType Directory -Force -Path $dep | Out-Null
 Copy-Item (Join-Path $PSScriptRoot "docker-compose.yml"), (Join-Path $PSScriptRoot "compose.env.example"), (Join-Path $PSScriptRoot "backup.ps1") $dep
@@ -51,7 +52,13 @@ Set-Content -Path (Join-Path $stage "VERSION.txt") -Value $Version -Encoding utf
 
 $zip = Join-Path $out "gantraah-$Version-node.zip"
 if (Test-Path $zip) { Remove-Item $zip }
-Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+# a standard zip (forward slashes), so it opens correctly on Linux too (Compress-Archive in
+# Windows PowerShell 5.1 writes backslashes). tar.exe is built into Windows 10 / Server 2019 and later.
+Push-Location $stage
+tar.exe -a -c -f $zip *
+$tarOk = ($LASTEXITCODE -eq 0)
+Pop-Location
+if (-not $tarOk) { throw "zip failed" }
 Write-Host "-- created $zip"
 
 $dockerOk = $false

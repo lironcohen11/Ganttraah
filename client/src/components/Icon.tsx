@@ -42,6 +42,7 @@ const PATHS: Record<string, string> = {
   grip: 'M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01',
   download: 'M12 4v11M7 10l5 5 5-5M5 20h14',
   upload: 'M12 16V5M7 10l5-5 5 5M5 20h14',
+  bell: 'M6 10a6 6 0 0112 0c0 5 2 6.5 2 6.5H4s2-1.5 2-6.5zM10 20a2.2 2.2 0 004 0',
   sun: 'M12 16a4 4 0 100-8 4 4 0 000 8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4',
   moon: 'M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z',
   auto: 'M12 3a9 9 0 100 18 9 9 0 000-18zM12 3v18M12 7.5h4M12 12h5M12 16.5h4',
@@ -49,6 +50,7 @@ const PATHS: Record<string, string> = {
   file: 'M14 3H6v18h12V7zM14 3v4h4M9 13h6M9 17h6',
   lock: 'M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 017 0v3',
   info: 'M12 21a9 9 0 100-18 9 9 0 000 18zM12 11v5M12 8h.01',
+  inbox: 'M3 13l3-8h12l3 8v6H3zM3 13h5l1.5 2.5h5L16 13h5',
 };
 
 export function Icon({ name, size = 16, className, strokeWidth = 2, fill }: { name: keyof typeof PATHS | string; size?: number; className?: string; strokeWidth?: number; fill?: string }) {

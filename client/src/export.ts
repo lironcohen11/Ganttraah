@@ -168,7 +168,7 @@ export function exportExcel(m: Model, scope: ExportScope) {
       const sp = st.get({ font: 'bold', fill: 'EEF1F6', border: true, num: 'pct', align: 'center' });
       list.push([{ v: '', s }, { v: p.name, s }, { v: p.name, s }, { v: 'פרויקט', s }, { v: '', s },
         { v: p.roots.length ? excelDate(p.start) : null, s: sd }, { v: p.roots.length ? excelDate(p.finish) : null, s: sd },
-        { v: p.percent / 100, s: sp }, { v: '', s }, { v: '', s }, { v: '', s }, { v: '', s }, { v: '', s }, { v: p.description || '', s }]);
+        { v: p.percent / 100, s: sp }, { v: '', s }, { v: '', s }, { v: p.target_finish ? excelDate(p.target_finish) : null, s: sd }, { v: p.target_missed ? 'כן' : '', s }, { v: '', s }, { v: p.description || '', s }]);
       continue;
     }
     const t = r.task;
@@ -325,7 +325,7 @@ export function exportMsProject(m: Model, scope: ExportScope) {
       const roots = p.roots.length;
       out.push(`<Task><UID>${projUid(p.id)}</UID><ID>${id}</ID><Name>${esc(p.name)}</Name><OutlineNumber>${p.sort_order || id}</OutlineNumber><OutlineLevel>1</OutlineLevel>
 <Start>${dt(roots ? p.start : p.start_date)}</Start><Finish>${dt(roots ? p.finish : p.start_date, true)}</Finish><Summary>1</Summary><Milestone>0</Milestone>
-<PercentComplete>${p.percent}</PercentComplete><Notes>${esc(p.description)}</Notes></Task>`);
+<PercentComplete>${p.percent}</PercentComplete>${p.target_finish ? `<Deadline>${dt(p.target_finish, true)}</Deadline>` : ''}<Notes>${esc(p.description)}</Notes></Task>`);
       continue;
     }
     const t = r.task;

@@ -3,6 +3,7 @@ import { useApp } from '../ctx';
 import { api } from '../api';
 import type { Project } from '../types';
 import { fmtDate, fmtDateTime } from '../dates';
+import { Icon } from './Icon';
 
 export const PROJECT_COLORS = [
   '#3b6fd8', '#2563eb', '#0e7490', '#0891b2', '#0f9d76', '#16a34a', '#65a30d', '#a16207',
@@ -16,13 +17,15 @@ export function ProjectDialog({ project, onClose }: { project: Project | null; o
   const [start, setStart] = useState(project?.start_date || model.data.today);
   const [color, setColor] = useState(project?.color || PROJECT_COLORS[model.projectList.length % PROJECT_COLORS.length]);
   const [desc, setDesc] = useState(project?.description || '');
+  const [target, setTarget] = useState(project?.target_finish || '');
+  const badTarget = !!target && target < start;
   const submit = async () => {
     if (!name.trim()) return;
     if (project) {
-      await run(() => api.patch(`/projects/${project.id}`, { name, start_date: start, color, description: desc }), 'הפרויקט עודכן');
+      await run(() => api.patch(`/projects/${project.id}`, { name, start_date: start, color, description: desc, target_finish: target || null }), 'הפרויקט עודכן');
       onClose();
     } else {
-      const r = await run(() => api.post<Project>('/projects', { name, start_date: start, color, description: desc }), 'הפרויקט נוצר');
+      const r = await run(() => api.post<Project>('/projects', { name, start_date: start, color, description: desc, target_finish: target || null }), 'הפרויקט נוצר');
       onClose(r?.id);
     }
   };
@@ -35,6 +38,18 @@ export function ProjectDialog({ project, onClose }: { project: Project | null; o
         <label className="field"><span className="f-label">תאריך התחלה</span>
           <input type="date" value={start} onChange={(e) => setStart(e.target.value)} />
           <span className="f-hint">משימות בלי תלויות יתחילו בתאריך הזה.</span></label>
+        <label className="field"><span className="f-label">תאריך סיום משוער</span>
+          <div className="with-clear">
+            <input type="date" value={target} min={start} onChange={(e) => setTarget(e.target.value)} />
+            {target && <button type="button" className="icon-btn" title="הסרה" onClick={() => setTarget('')}><Icon name="x" size={13} /></button>}
+          </div>
+          <span className={`f-hint ${badTarget ? 'bad' : ''}`}>
+            {badTarget ? 'הסיום המשוער לפני תאריך ההתחלה.'
+              : project && target && project.roots.length
+                ? (project.finish > target ? <span className="bad">לפי התוכנית הפרויקט מסתיים ב-{fmtDate(project.finish)}, אחרי הסיום המשוער.</span>
+                  : <>לפי התוכנית הפרויקט מסתיים ב-{fmtDate(project.finish)}, בזמן.</>)
+                : 'מתי הפרויקט אמור להסתיים, מקצה לקצה. בגאנט רואים אותו כדגל, ואם התוכנית עוברת אותו, הפרויקט מסומן.'}
+          </span></label>
         <div className="field"><span className="f-label">צבע</span>
           <div className="swatches many">
             {PROJECT_COLORS.map((c) => <button key={c} className={`sw ${c.toLowerCase() === color.toLowerCase() ? 'on' : ''}`} style={{ background: c }} onClick={() => setColor(c)} aria-label={c} />)}
@@ -70,7 +85,7 @@ export function ProjectDialog({ project, onClose }: { project: Project | null; o
           )}
           <span style={{ flex: 1 }} />
           <button className="btn" onClick={() => onClose()}>ביטול</button>
-          <button className="btn primary" disabled={!name.trim()} onClick={submit}>{project ? 'שמירה' : 'יצירה'}</button>
+          <button className="btn primary" disabled={!name.trim() || badTarget} onClick={submit}>{project ? 'שמירה' : 'יצירה'}</button>
         </div>
       </div>
     </div>

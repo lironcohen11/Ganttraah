@@ -1,9 +1,15 @@
-import type { AppData, Dep, Project, Task, Status, Unit } from './types';
+import type { AppData, Delay, Dep, Project, Task, Status, Unit } from './types';
 import { WorkCalendar } from './dates';
 
 export const STATUS_LABEL: Record<Status, string> = {
   done: 'הושלמה', active: 'בביצוע', planned: 'מתוכננת', behind: 'בפיגור', late: 'באיחור',
 };
+/** why a task was postponed (the same fixed list as the server) */
+export const DELAY_REASONS: Record<string, string> = {
+  tech_debt: 'חוב טכני', fault: 'תקלה', product: 'מוצרי', staffing: 'אילוצי כוח-אדם',
+  pricing: 'תמחור לקוי', external: 'תלות בגורם חיצוני', other: 'אחר',
+};
+export const delayLabel = (r: string | null, other?: string) => (!r ? '' : r === 'other' ? (other ? `אחר: ${other}` : 'אחר') : DELAY_REASONS[r] || '');
 export const DEP_LABEL: Record<string, string> = { FS: 'סיום ← התחלה', SS: 'התחלה ← התחלה', FF: 'סיום ← סיום' };
 export const DEP_SHORT: Record<string, string> = { FS: 'אחרי סיום', SS: 'עם ההתחלה', FF: 'יחד בסיום' };
 export const depText = (type: string, lag: number) =>
@@ -19,8 +25,10 @@ export class Model {
   units = new Map<number, Unit>();
   unitKids = new Map<number | null, Unit[]>();
   favorites: Set<number>;
+  delays = new Map<number, Delay>();
 
   constructor(public data: AppData) {
+    for (const x of data.delays || []) this.delays.set(x.task_id, x);
     for (const u of data.units || []) {
       this.units.set(u.id, u);
       if (!this.unitKids.has(u.parent_id)) this.unitKids.set(u.parent_id, []);
@@ -170,6 +178,19 @@ export interface RowOptions {
   showProjects?: boolean;
   owners?: number[] | null;      // show only tasks of these units (and units below them)
   only?: Set<number> | null;     // show only these tasks (e.g. favourites), with their parents as context
+}
+
+/** Progress in this version: how many tasks are marked done, out of all the tasks (leaves) under these */
+export function doneCount(m: Model, ids: Iterable<number>) {
+  let done = 0, total = 0;
+  const walk = (id: number) => {
+    const t = m.task(id);
+    if (!t) return;
+    if (t.children.length) t.children.forEach(walk);
+    else { total++; if (t.percent >= 100) done++; }
+  };
+  for (const id of ids) walk(id);
+  return { done, total };
 }
 
 export function buildRows(m: Model, o: RowOptions): Row[] {
